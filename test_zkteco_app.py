@@ -17,12 +17,7 @@ import unittest
 from datetime import datetime, date, timedelta
 from unittest.mock import MagicMock, patch, PropertyMock
 
-# ── Mock tkinter before importing app ─────────────────────────────────────────
-for mod in ['tkinter', 'tkinter.ttk', 'tkinter.filedialog',
-            'tkinter.messagebox', 'tkinter.scrolledtext']:
-    sys.modules[mod] = MagicMock()
-
-# ── Import app module ─────────────────────────────────────────────────────────
+# ── Import app module (UI is PySide6; importing it does not start Qt) ─────────
 import importlib.util
 _spec = importlib.util.spec_from_file_location(
     "zkteco_app",

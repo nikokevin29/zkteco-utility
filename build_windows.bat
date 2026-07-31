@@ -1,12 +1,12 @@
 @echo off
-title ZKTeco Utility — Windows Build
+title ZKTeco Utility - Windows Build
 echo ============================================
-echo  ZKTeco eFace10 Utility — Windows Build
+echo  ZKTeco eFace10 Utility - Windows Build
 echo ============================================
 echo.
 
 echo [1/3] Install dependencies...
-pip install pyzk openpyxl pyinstaller pillow --quiet
+pip install pyzk openpyxl pyinstaller PySide6 --quiet
 
 echo.
 echo [2/3] Build exe...
@@ -32,10 +32,11 @@ pyinstaller --onefile --windowed ^
   --hidden-import zk.user ^
   --hidden-import zk.attendance ^
   --exclude-module pandas ^
+  --exclude-module tkinter ^
+  --exclude-module PIL ^
   --exclude-module numpy ^
   --exclude-module scipy ^
   --exclude-module matplotlib ^
-  --exclude-module PIL ^
   --exclude-module sklearn ^
   --exclude-module IPython ^
   --exclude-module pytest ^
@@ -54,3 +55,5 @@ echo.
 echo EXE: dist\ZKTeco_Utility.exe
 echo Taruh EXE + config.json di folder tersendiri.
 pause
+
+

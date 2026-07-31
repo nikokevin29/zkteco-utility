@@ -1,6 +1,6 @@
 # ZKTeco Utility — Project Summary
 
-Desktop app (Python/tkinter, single window) untuk mesin absen **ZKTeco eFace10** di CV RAJ.
+Desktop app (Python/**PySide6** sejak v5.0.0, sebelumnya tkinter; single window) untuk mesin absen **ZKTeco eFace10** di CV RAJ.
 Tarik log absensi via LAN → simpan SQLite → generate laporan Excel berformat → preview in-app.
 
 **Konteks hardware penting:** eFace10 TIDAK punya baterai RTC. Mati listrik = jam mesin reset ke tahun 2000, absensi selama outage tercatat tanggal palsu. Sebagian besar kompleksitas app ini ada untuk menangani itu (anomaly recovery + auto clock sync).
@@ -9,7 +9,7 @@ Tarik log absensi via LAN → simpan SQLite → generate laporan Excel berformat
 
 | File | Isi |
 |------|-----|
-| `zkteco_app.py` | SEMUA logika app (~1500 baris, satu file, sengaja): config, SQLite, anomaly recovery, Excel generator, seluruh UI |
+| `zkteco_app.py` | SEMUA logika app (~1800 baris, satu file, sengaja): config, SQLite, anomaly recovery, Excel generator, seluruh UI (PySide6) |
 | `updater.py` | Auto-update dari GitHub Releases (`nikokevin29/zkteco-utility`). Download → rename old `_old.exe` → replace → restart |
 | `recover_and_export.py` | Script standalone one-off: recovery anomali + export ke Desktop tanpa buka app. Duplikasi logika in-app (import dari zkteco_app), kandidat hapus kalau tak dipakai lagi |
 | `test_zkteco_app.py` | 55 test unittest/pytest: anomaly detection/remap, gap-finder, DB CRUD, config, excel bytes, updater version compare. Run: `py -m pytest test_zkteco_app.py -q` |
@@ -33,6 +33,10 @@ Tarik log absensi via LAN → simpan SQLite → generate laporan Excel berformat
 - **Live Monitor** (`_toggle_live`/`_live_loop`, v4.6.0): koneksi sendiri di luar `_run` (tombol lain tetap aktif), `conn.live_capture()` loop dengan auto-reconnect 30s. Tiap punch: log + toast `_toast` (Toplevel pojok kanan bawah, 4s, tanpa dependency) + insert DB langsung (dedup via timestamp UNIQUE). Stop via flag `_live_want` + `end_live_capture`
 - **Capacity warning** (`_check_capacity`, v4.6.0): `conn.read_sizes()` saat Test/Pull — log ≥80% penuh → popup suruh pull + clear. Device Info tampilkan `users/cap` & `records/cap`
 - **Autostart** (`_apply_autostart`, v4.6.0): toggle di Settings → registry `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` via winreg, exe dijalankan dengan flag `--minimized` (window iconify). Hanya jalan dari exe (bukan .py). Toggle kedua `live_autostart`: live monitor nyala otomatis 1.5s setelah launch
+- **UI PySide6** (v5.0.0): seluruh layer view di bawah divider `UI — PySide6` di zkteco_app.py — QSS stylesheet global (`QSS`), `_Bridge`/`self.ui(fn)` = satu-satunya cara update UI dari thread (pengganti `self.after(0,...)`), tabel via helper `_mk_table`/`_fill_table`, toast QLabel fade-in. Logika di atas divider TIDAK berubah dari era tkinter
+- **System tray** (QSystemTrayIcon, tanpa pystray): klik X = sembunyi ke tray (live monitor & clock guard tetap jalan), menu tray Open Dashboard/Exit, `--minimized` langsung ke tray; `setQuitOnLastWindowClosed(False)`
+- **Clock guard berkala** (v4.8.0): `_clock_tick` tiap 10 mnt (saat live monitor off) + `_check_clock(quiet=True)` di tiap (re)connect live monitor — jam mesin yang reset karena mati listrik otomatis dibetulkan ≤10 mnt tanpa buka app
+- **Installer** (v4.8.0): `installer.iss` (Inno Setup) → `ISCC installer.iss` → `dist\ZKTeco_Utility_Setup.exe`, install per-user ke `%LOCALAPPDATA%\ZKTeco Utility` tanpa admin; uninstall TIDAK menghapus config/db. Path data frozen exe fix: `_BASE` = sebelah exe (bukan `_MEIPASS`)
 - **Pull**: deteksi record tahun-2000 → auto-remap (anchor dari config atau auto gap-finder) → warning popup + backup CSV audit → insert DB (dedup via timestamp UNIQUE)
 - **Today dashboard + Daily tab** (v4.7.0): tab `🏠 Today` (default) = stat tiles Hadir/Telat/Belum Absen + tree punch hari ini, auto-refresh dari live monitor; tab `📅 Daily` = view harian langsung dari DB via `compute_daily_rows(rows, cfg)` (module-level, sengaja duplikat matematika telat dari `generate_excel_bytes` — jangan refactor generatornya). `_setup_style` = ttk theme clam + palet konsisten
 - Report disimpan sebagai snapshot xlsx blob di DB, bisa di-load/export ulang dari tab History
