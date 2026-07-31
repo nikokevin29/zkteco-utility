@@ -10,7 +10,7 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 import csv, os, threading, calendar, sqlite3, json, sys, time
 from datetime import datetime, date, timedelta
 
-APP_VERSION = "4.6.0"
+APP_VERSION = "4.7.0"
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 DB_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "absensi.db")
 
@@ -268,6 +268,37 @@ def db_delete_excel_snapshot(snap_id):
     c = conn.cursor()
     c.execute('DELETE FROM excel_snapshots WHERE id=?', (snap_id,))
     conn.commit(); conn.close()
+
+def compute_daily_rows(rows, cfg):
+    """Per-(nama, tanggal) daily summary straight from attendance rows.
+    # ponytail: mirrors generate_excel_bytes math; kept separate so the
+    # heavily-tested excel generator stays untouched"""
+    user_map = {int(k): v for k, v in cfg.get('user_map', {}).items()}
+    std_in = datetime.strptime(cfg.get('jam_masuk', '08:00'), '%H:%M')
+    tol_dt = std_in + timedelta(minutes=int(cfg.get('toleransi', 15)))
+    raw = {}
+    for r in rows:
+        ts = r['timestamp']
+        if isinstance(ts, str):
+            ts = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
+        if ts.year <= ANOMALY_YEAR:
+            continue
+        nama = user_map.get(r['uid'], r.get('nama') or f"UID:{r['uid']}")
+        raw.setdefault((nama, ts.date()), []).append(ts)
+    out = []
+    for (nama, tgl), taps in sorted(raw.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        taps.sort()
+        masuk = taps[0]
+        keluar = taps[-1] if len(taps) > 1 else None
+        t = datetime.strptime(masuk.strftime('%H:%M'), '%H:%M')
+        telat = int((t - std_in).total_seconds() // 60) if t > tol_dt else 0
+        durasi = int((keluar - masuk).total_seconds() // 60) if keluar else 0
+        out.append({'nama': nama, 'tanggal': tgl,
+                    'masuk': masuk.strftime('%H:%M'),
+                    'keluar': keluar.strftime('%H:%M') if keluar else '-',
+                    'telat': telat, 'durasi': durasi,
+                    'weekend': tgl.weekday() >= 5})
+    return out
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EXCEL GENERATOR — returns bytes instead of saving to file
@@ -806,6 +837,7 @@ class App(tk.Tk):
         self._build_ui()
         self._update_status()
         self._refresh_history()
+        self._refresh_today()
         # Cleanup leftover _old.exe from previous update
         try:
             from updater import cleanup_old_exe
@@ -815,7 +847,21 @@ class App(tk.Tk):
         if '--minimized' in sys.argv: self.iconify()
         if self.cfg.get('live_autostart',False): self.after(1500,self._toggle_live)
 
+    def _setup_style(self):
+        s=ttk.Style(self)
+        try: s.theme_use('clam')
+        except tk.TclError: pass
+        s.configure('TButton',padding=4,background='#E2E8F0',font=('Segoe UI',9))
+        s.map('TButton',background=[('active','#1A56DB')],foreground=[('active','white')])
+        s.configure('TNotebook',background='#F8FAFC',borderwidth=0)
+        s.configure('TNotebook.Tab',padding=[10,4],font=('Segoe UI',9))
+        s.map('TNotebook.Tab',background=[('selected','#FFFFFF')])
+        s.configure('Treeview',rowheight=22,fieldbackground='#FFFFFF',font=('Segoe UI',9))
+        s.configure('Treeview.Heading',font=('Segoe UI',9,'bold'),background='#E2E8F0')
+        s.configure('TLabelframe.Label',foreground='#1A56DB',font=('Segoe UI',9,'bold'))
+
     def _build_ui(self):
+        self._setup_style()
         # ── Header ────────────────────────────────────────────────────────────
         hdr=tk.Frame(self,bg='#1A56DB'); hdr.pack(fill='x')
         _base=os.path.dirname(os.path.abspath(__file__))
@@ -949,6 +995,35 @@ class App(tk.Tk):
         nb=ttk.Notebook(right)
         nb.pack(fill='both',expand=True,padx=4,pady=4)
 
+        # ── Tab 0: Today dashboard ────────────────────────────────────────────
+        tab_today=ttk.Frame(nb)
+        nb.add(tab_today,text='🏠 Today')
+
+        ttb=tk.Frame(tab_today,bg='#E2E8F0',pady=4)
+        ttb.pack(fill='x')
+        tk.Label(ttb,text='Absensi hari ini',font=('Segoe UI',9,'bold'),bg='#E2E8F0').pack(side='left',padx=8)
+        ttk.Button(ttb,text='🔄 Refresh',command=self._refresh_today).pack(side='right',padx=8)
+
+        tiles=tk.Frame(tab_today,bg='#F8FAFC'); tiles.pack(fill='x',padx=8,pady=8)
+        self.tile_hadir=self._mktile(tiles,'Hadir','#D1FAE5','#065F46')
+        self.tile_telat=self._mktile(tiles,'Telat','#FED7AA','#9A3412')
+        self.tile_absen=self._mktile(tiles,'Belum Absen','#FEE2E2','#991B1B')
+
+        tt_frame=tk.Frame(tab_today); tt_frame.pack(fill='both',expand=True,padx=8,pady=(0,8))
+        tt_vsb=ttk.Scrollbar(tt_frame,orient='vertical'); tt_vsb.pack(side='right',fill='y')
+        self.today_tree=ttk.Treeview(tt_frame,columns=('nama','masuk','status'),
+                                     show='headings',yscrollcommand=tt_vsb.set)
+        tt_vsb.config(command=self.today_tree.yview)
+        for col,w,lbl in [('nama',160,'Nama'),('masuk',80,'Jam Masuk'),('status',100,'Status')]:
+            self.today_tree.heading(col,text=lbl)
+            self.today_tree.column(col,width=w,anchor='center' if col!='nama' else 'w')
+        self.today_tree.pack(fill='both',expand=True)
+        self.today_tree.tag_configure('ok',background='#D1FAE5')
+        self.today_tree.tag_configure('late',background='#FED7AA')
+
+        nb.bind('<<NotebookTabChanged>>',
+                lambda e: self._refresh_today() if nb.index('current')==0 else None)
+
         # ── Tab 1: Report Viewer ──────────────────────────────────────────────
         tab_view=ttk.Frame(nb)
         nb.add(tab_view,text='📊 Report Viewer')
@@ -1047,6 +1122,76 @@ class App(tk.Tk):
         ttk.Button(snbf,text='💾 Export to File',command=self._export_snapshot).pack(side='left',padx=4)
         ttk.Button(snbf,text='🗑 Delete',command=self._delete_snapshot).pack(side='left',padx=4)
         tk.Label(snbf,text='Double-click to preview',font=('Segoe UI',8),fg='#888').pack(side='left',padx=6)
+
+        # ── Tab 3: Daily view (langsung dari DB) ──────────────────────────────
+        tab_daily=ttk.Frame(nb)
+        nb.add(tab_daily,text='📅 Daily')
+
+        dtb=tk.Frame(tab_daily,bg='#E2E8F0',pady=4)
+        dtb.pack(fill='x')
+        tk.Label(dtb,text='Bulan:',font=('Segoe UI',9),bg='#E2E8F0').pack(side='left',padx=(8,2))
+        now=datetime.now()
+        self.daily_bulan=tk.StringVar(value=str(now.month))
+        ttk.Combobox(dtb,textvariable=self.daily_bulan,values=[str(i) for i in range(1,13)],
+                     width=4,state='readonly').pack(side='left')
+        tk.Label(dtb,text='Tahun:',font=('Segoe UI',9),bg='#E2E8F0').pack(side='left',padx=(8,2))
+        self.daily_tahun=tk.StringVar(value=str(now.year))
+        ttk.Combobox(dtb,textvariable=self.daily_tahun,
+                     values=[str(y) for y in range(now.year-3,now.year+2)],
+                     width=6,state='readonly').pack(side='left')
+        ttk.Button(dtb,text='🔍 Load',command=self._refresh_daily).pack(side='left',padx=8)
+
+        dt_frame=tk.Frame(tab_daily); dt_frame.pack(fill='both',expand=True,padx=8,pady=8)
+        dt_vsb=ttk.Scrollbar(dt_frame,orient='vertical'); dt_vsb.pack(side='right',fill='y')
+        self.daily_tree=ttk.Treeview(dt_frame,
+                                     columns=('nama','tanggal','masuk','keluar','telat','durasi'),
+                                     show='headings',yscrollcommand=dt_vsb.set)
+        dt_vsb.config(command=self.daily_tree.yview)
+        for col,w,lbl in [('nama',140,'Nama'),('tanggal',90,'Tanggal'),('masuk',60,'Masuk'),
+                          ('keluar',60,'Keluar'),('telat',80,'Telat (mnt)'),('durasi',80,'Durasi')]:
+            self.daily_tree.heading(col,text=lbl)
+            self.daily_tree.column(col,width=w,anchor='center' if col!='nama' else 'w')
+        self.daily_tree.pack(fill='both',expand=True)
+        self.daily_tree.tag_configure('ok',background='#D1FAE5')
+        self.daily_tree.tag_configure('late',background='#FED7AA')
+        self.daily_tree.tag_configure('weekend',background='#FEF9C3')
+
+    def _mktile(self,parent,caption,bg,fg):
+        f=tk.Frame(parent,bg=bg,padx=16,pady=8)
+        f.pack(side='left',expand=True,fill='x',padx=4)
+        num=tk.Label(f,text='0',font=('Segoe UI',20,'bold'),bg=bg,fg=fg)
+        num.pack()
+        tk.Label(f,text=caption,font=('Segoe UI',9),bg=bg,fg=fg).pack()
+        return num
+
+    def _refresh_today(self):
+        today=date.today()
+        rows=[r for r in db_query_attendance(today.year,today.month)
+              if r['timestamp'].date()==today]
+        drows=compute_daily_rows(rows,self.cfg)
+        self.today_tree.delete(*self.today_tree.get_children())
+        for d in drows:
+            tag='late' if d['telat'] else 'ok'
+            status=f"Telat {d['telat']}m" if d['telat'] else 'Hadir'
+            self.today_tree.insert('','end',values=(d['nama'],d['masuk'],status),tags=(tag,))
+        telat=sum(1 for d in drows if d['telat'])
+        hadir=len(drows)-telat
+        absen=max(len(self.cfg.get('user_map',{}))-len(drows),0)
+        self.tile_hadir.config(text=str(hadir))
+        self.tile_telat.config(text=str(telat))
+        self.tile_absen.config(text=str(absen))
+
+    def _refresh_daily(self):
+        y=int(self.daily_tahun.get()); m=int(self.daily_bulan.get())
+        drows=compute_daily_rows(db_query_attendance(y,m),self.cfg)
+        self.daily_tree.delete(*self.daily_tree.get_children())
+        for d in drows:
+            tag='weekend' if d['weekend'] else ('late' if d['telat'] else 'ok')
+            dur=f"{d['durasi']//60}j {d['durasi']%60}m" if d['durasi'] else '-'
+            self.daily_tree.insert('','end',values=(
+                d['nama'],d['tanggal'].strftime('%d-%m-%Y'),d['masuk'],d['keluar'],
+                d['telat'] or '-',dur),tags=(tag,))
+        self._log(f'Daily view: {len(drows)} baris untuk {m}/{y}')
 
     # ── UI Helpers ────────────────────────────────────────────────────────────
     def _log(self,msg):
@@ -1434,6 +1579,7 @@ class App(tk.Tk):
                     db_insert_attendance([{'uid':int(att.user_id),'nama':name,
                                            'timestamp':att.timestamp,'punch':att.punch}])
                     self.after(0,self._update_status)
+                    self.after(0,self._refresh_today)
             except Exception as e:
                 if self._live_want: self._log(f'⚠ Live monitor: {e} — reconnecting in 30s')
             finally:

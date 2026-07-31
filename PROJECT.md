@@ -34,6 +34,7 @@ Tarik log absensi via LAN → simpan SQLite → generate laporan Excel berformat
 - **Capacity warning** (`_check_capacity`, v4.6.0): `conn.read_sizes()` saat Test/Pull — log ≥80% penuh → popup suruh pull + clear. Device Info tampilkan `users/cap` & `records/cap`
 - **Autostart** (`_apply_autostart`, v4.6.0): toggle di Settings → registry `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` via winreg, exe dijalankan dengan flag `--minimized` (window iconify). Hanya jalan dari exe (bukan .py). Toggle kedua `live_autostart`: live monitor nyala otomatis 1.5s setelah launch
 - **Pull**: deteksi record tahun-2000 → auto-remap (anchor dari config atau auto gap-finder) → warning popup + backup CSV audit → insert DB (dedup via timestamp UNIQUE)
+- **Today dashboard + Daily tab** (v4.7.0): tab `🏠 Today` (default) = stat tiles Hadir/Telat/Belum Absen + tree punch hari ini, auto-refresh dari live monitor; tab `📅 Daily` = view harian langsung dari DB via `compute_daily_rows(rows, cfg)` (module-level, sengaja duplikat matematika telat dari `generate_excel_bytes` — jangan refactor generatornya). `_setup_style` = ttk theme clam + palet konsisten
 - Report disimpan sebagai snapshot xlsx blob di DB, bisa di-load/export ulang dari tab History
 - `⚡ All at Once` = pull + report sekaligus
 

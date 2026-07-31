@@ -710,6 +710,31 @@ class TestIntegration(unittest.TestCase):
 # RUNNER
 # ═════════════════════════════════════════════════════════════════════════════
 
+class TestComputeDailyRows(unittest.TestCase):
+    CFG = {'jam_masuk': '08:00', 'toleransi': 15, 'user_map': {'1': 'NICHOLAS'}}
+
+    def test_late_and_duration(self):
+        rows = [
+            {'uid': 1, 'nama': '', 'timestamp': datetime(2026, 7, 1, 8, 20), 'punch': 0},
+            {'uid': 1, 'nama': '', 'timestamp': datetime(2026, 7, 1, 17, 30), 'punch': 1},
+        ]
+        d = app.compute_daily_rows(rows, self.CFG)[0]
+        self.assertEqual(d['nama'], 'NICHOLAS')
+        self.assertEqual(d['masuk'], '08:20')
+        self.assertEqual(d['keluar'], '17:30')
+        self.assertEqual(d['telat'], 20)
+        self.assertEqual(d['durasi'], 550)
+        self.assertFalse(d['weekend'])
+
+    def test_single_tap_on_time(self):
+        rows = [{'uid': 1, 'nama': '', 'timestamp': datetime(2026, 7, 4, 8, 10), 'punch': 0}]
+        d = app.compute_daily_rows(rows, self.CFG)[0]
+        self.assertEqual(d['keluar'], '-')
+        self.assertEqual(d['durasi'], 0)
+        self.assertEqual(d['telat'], 0)   # within 15-min tolerance
+        self.assertTrue(d['weekend'])     # 2026-07-04 = Saturday
+
+
 if __name__ == '__main__':
     loader = unittest.TestLoader()
     suite  = unittest.TestSuite()
