@@ -38,6 +38,7 @@ Tarik log absensi via LAN → simpan SQLite → generate laporan Excel berformat
 - **Clock guard berkala** (v4.8.0): `_clock_tick` tiap 10 mnt (saat live monitor off) + `_check_clock(quiet=True)` di tiap (re)connect live monitor — jam mesin yang reset karena mati listrik otomatis dibetulkan ≤10 mnt tanpa buka app
 - **Installer** (v4.8.0): `installer.iss` (Inno Setup) → `ISCC installer.iss` → `dist\ZKTeco_Utility_Setup.exe`, install per-user ke `%LOCALAPPDATA%\ZKTeco Utility` tanpa admin; uninstall TIDAK menghapus config/db. Path data frozen exe fix: `_BASE` = sebelah exe (bukan `_MEIPASS`)
 - **Pull**: deteksi record tahun-2000 → auto-remap (anchor dari config atau auto gap-finder) → warning popup + backup CSV audit → insert DB (dedup via timestamp UNIQUE)
+- **Cloud sync VST** (v5.2.0): Settings → Cloud Sync; POST ke `service.rejekiamerta.com/api/attendance/sync` (Bearer token per company); auto setelah Pull + tombol manual
 - **Today dashboard + Daily tab** (v4.7.0): tab `🏠 Today` (default) = stat tiles Hadir/Telat/Belum Absen + tree punch hari ini, auto-refresh dari live monitor; tab `📅 Daily` = view harian langsung dari DB via `compute_daily_rows(rows, cfg)` (module-level, sengaja duplikat matematika telat dari `generate_excel_bytes` — jangan refactor generatornya). `_setup_style` = ttk theme clam + palet konsisten
 - Report disimpan sebagai snapshot xlsx blob di DB, bisa di-load/export ulang dari tab History
 - `⚡ All at Once` = pull + report sekaligus

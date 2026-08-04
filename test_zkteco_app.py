@@ -152,17 +152,33 @@ class TestDatabase(unittest.TestCase):
     def test_insert_attendance_basic(self):
         rows = _make_rows(5)
         with patch.object(app, 'DB_FILE', self.db):
-            inserted = app.db_insert_attendance(rows)
+            inserted, skipped = app.db_insert_attendance(rows)
         self.assertGreater(inserted, 0)
+        self.assertEqual(skipped, 0)
 
     def test_insert_attendance_deduplicates(self):
         """Inserting same rows twice: second insert adds 0 new records."""
         rows = _make_rows(5)
         with patch.object(app, 'DB_FILE', self.db):
-            first  = app.db_insert_attendance(rows)
-            second = app.db_insert_attendance(rows)
+            first, _ = app.db_insert_attendance(rows)
+            second, skip2 = app.db_insert_attendance(rows)
         self.assertGreater(first, 0)
         self.assertEqual(second, 0)
+        self.assertGreater(skip2, 0)
+
+    def test_two_users_same_timestamp_both_kept(self):
+        """UNIQUE is (uid, timestamp) — different users may share a second."""
+        ts = datetime(2026, 5, 1, 8, 0, 0)
+        rows = [
+            {'uid': 1, 'nama': 'A', 'timestamp': ts, 'punch': 0},
+            {'uid': 2, 'nama': 'B', 'timestamp': ts, 'punch': 0},
+        ]
+        with patch.object(app, 'DB_FILE', self.db):
+            ins, skip = app.db_insert_attendance(rows)
+            result = app.db_query_attendance()
+        self.assertEqual(ins, 2)
+        self.assertEqual(skip, 0)
+        self.assertEqual(len(result), 2)
 
     def test_insert_attendance_filters_year_2000(self):
         """Records with timestamp year <= 2000 are inserted but filtered on query."""
@@ -612,13 +628,39 @@ class TestAppSyntax(unittest.TestCase):
 
     def test_default_config_has_required_keys(self):
         required = ['ip', 'port', 'jam_masuk', 'jam_keluar',
-                    'toleransi', 'lang', 'auto_backup', 'user_map']
+                    'toleransi', 'lang', 'auto_backup', 'user_map',
+                    'cloud_sync_enabled', 'cloud_api_url', 'cloud_api_token',
+                    'cloud_sync_after_pull',
+                    'silent_mode', 'auto_pull_on_start', 'auto_pull_interval_min']
         for key in required:
             self.assertIn(key, app.DEFAULT_CONFIG, f"Missing key: {key}")
 
     def test_db_file_and_config_file_are_absolute_paths(self):
         self.assertTrue(os.path.isabs(app.DB_FILE))
         self.assertTrue(os.path.isabs(app.CONFIG_FILE))
+
+    def test_build_cloud_payload_shape(self):
+        cfg = {
+            'user_map': {'1': 'NICHOLAS', '2': 'SERLI'},
+        }
+        punches = [{
+            'uid': 1, 'nama': 'NICHOLAS',
+            'timestamp': datetime(2026, 8, 1, 8, 5, 0),
+            'punch': 0, 'recovered': False,
+        }]
+        with patch.object(app, 'db_list_leaves', return_value=[
+            {'uid': 2, 'tanggal': '2026-08-01', 'jenis': 'izin', 'note': 'dokter'},
+        ]):
+            body = app.build_cloud_payload(cfg, punches=punches)
+        self.assertEqual(len(body['employees']), 2)
+        self.assertEqual(body['punches'][0]['timestamp'], '2026-08-01 08:05:00')
+        self.assertEqual(body['leaves'][0]['jenis'], 'izin')
+
+    def test_cloud_sync_requires_token(self):
+        cfg = {'cloud_sync_enabled': True, 'cloud_api_url': 'https://x/api/attendance',
+               'cloud_api_token': '', 'user_map': {}}
+        with self.assertRaises(RuntimeError):
+            app.cloud_sync(cfg, punches=[])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -646,7 +688,7 @@ class TestIntegration(unittest.TestCase):
 
         with patch.object(app, 'DB_FILE', self.db):
             # 2. Insert to DB
-            new = app.db_insert_attendance(pulled_rows)
+            new, skip = app.db_insert_attendance(pulled_rows)
             self.assertGreater(new, 0)
 
             # 3. Record pull session
@@ -706,7 +748,10 @@ class TestIntegration(unittest.TestCase):
 # ═════════════════════════════════════════════════════════════════════════════
 
 class TestComputeDailyRows(unittest.TestCase):
-    CFG = {'jam_masuk': '08:00', 'toleransi': 15, 'user_map': {'1': 'NICHOLAS'}}
+    CFG = {
+        'jam_masuk': '08:00', 'jam_keluar': '16:00', 'toleransi': 15,
+        'user_map': {'1': 'NICHOLAS'}, 'punch_mode': 'first_last',
+    }
 
     def test_late_and_duration(self):
         rows = [
@@ -720,14 +765,170 @@ class TestComputeDailyRows(unittest.TestCase):
         self.assertEqual(d['telat'], 20)
         self.assertEqual(d['durasi'], 550)
         self.assertFalse(d['weekend'])
+        self.assertFalse(d['no_checkout'])
 
-    def test_single_tap_on_time(self):
+    def test_single_tap_no_checkout_flag(self):
         rows = [{'uid': 1, 'nama': '', 'timestamp': datetime(2026, 7, 4, 8, 10), 'punch': 0}]
         d = app.compute_daily_rows(rows, self.CFG)[0]
         self.assertEqual(d['keluar'], '-')
         self.assertEqual(d['durasi'], 0)
         self.assertEqual(d['telat'], 0)   # within 15-min tolerance
         self.assertTrue(d['weekend'])     # 2026-07-04 = Saturday
+        self.assertTrue(d['no_checkout'])
+        self.assertEqual(d['status'], 'NO_CHECKOUT')
+
+    def test_device_punch_mode(self):
+        cfg = dict(self.CFG); cfg['punch_mode'] = 'device_punch'
+        rows = [
+            # mid-day "in" then early "out" then late "in" — first_last would use 12:00/18:00
+            {'uid': 1, 'nama': '', 'timestamp': datetime(2026, 7, 1, 12, 0), 'punch': 0},
+            {'uid': 1, 'nama': '', 'timestamp': datetime(2026, 7, 1, 13, 0), 'punch': 1},
+            {'uid': 1, 'nama': '', 'timestamp': datetime(2026, 7, 1, 8, 5), 'punch': 0},
+            {'uid': 1, 'nama': '', 'timestamp': datetime(2026, 7, 1, 17, 0), 'punch': 1},
+        ]
+        d = app.compute_daily_rows(rows, cfg)[0]
+        self.assertEqual(d['masuk'], '08:05')   # first punch-in
+        self.assertEqual(d['keluar'], '17:00')  # last punch-out
+
+    def test_recovered_flag(self):
+        rows = [
+            {'uid': 1, 'nama': '', 'timestamp': datetime(2026, 7, 1, 8, 0), 'punch': 0, 'recovered': True},
+            {'uid': 1, 'nama': '', 'timestamp': datetime(2026, 7, 1, 16, 0), 'punch': 1, 'recovered': True},
+        ]
+        d = app.compute_daily_rows(rows, self.CFG)[0]
+        self.assertTrue(d['recovered'])
+
+
+class TestGapFinderSoft(unittest.TestCase):
+
+    def test_single_gap_returns_start(self):
+        # normal days: May 1-5 and May 15-20 → gap May 6-14
+        recs = []
+        for d in list(range(1, 6)) + list(range(15, 21)):
+            recs.append({'timestamp': datetime(2026, 5, d, 8, 0)})
+        self.assertEqual(app.find_gap_start(recs), date(2026, 5, 6))
+
+    def test_multi_significant_gaps_returns_none(self):
+        # two multi-day holes → ambiguous
+        recs = []
+        for d in [1, 2, 10, 11, 20, 21]:
+            recs.append({'timestamp': datetime(2026, 5, d, 8, 0)})
+        # gaps of ~7 and ~8 days → multi significant
+        self.assertIsNone(app.find_gap_start(recs))
+
+    def test_empty_normal_returns_none(self):
+        self.assertIsNone(app.find_gap_start([]))
+
+
+class TestLeaveAndPayroll(unittest.TestCase):
+
+    def setUp(self):
+        self.db = _tmp_db()
+        with patch.object(app, 'DB_FILE', self.db):
+            app.init_db()
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def test_leave_crud(self):
+        with patch.object(app, 'DB_FILE', self.db):
+            app.db_set_leave(1, '2026-05-10', 'cuti', 'libur')
+            rows = app.db_list_leaves(2026, 5)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['jenis'], 'cuti')
+            m = app.db_leave_map(2026, 5)
+            self.assertEqual(m[(1, date(2026, 5, 10))], 'cuti')
+            app.db_delete_leave(1, '2026-05-10')
+            self.assertEqual(app.db_list_leaves(2026, 5), [])
+
+    def test_leave_in_daily_rows(self):
+        with patch.object(app, 'DB_FILE', self.db):
+            app.db_set_leave(1, date(2026, 5, 2), 'izin')
+            leave_map = app.db_leave_map(2026, 5)
+        cfg = dict(app.DEFAULT_CONFIG)
+        cfg['user_map'] = {'1': 'NICHOLAS'}
+        drows = app.compute_daily_rows([], cfg, leave_map)
+        self.assertEqual(len(drows), 1)
+        self.assertEqual(drows[0]['status'], 'IZIN')
+
+    def test_payroll_csv_has_header(self):
+        with patch.object(app, 'DB_FILE', self.db):
+            rows = _make_rows(3, base_date=date(2026, 5, 1))
+            cfg = dict(app.DEFAULT_CONFIG)
+            cfg['user_map'] = {'1': 'NICHOLAS', '2': 'SERLI', '3': 'TIA'}
+            data = app.generate_payroll_bytes(rows, cfg, 2026, 5)
+        text = data.decode('utf-8-sig')
+        self.assertIn('UID,Nama,Tanggal', text)
+        self.assertIn('Status', text)
+        self.assertIn('NoCheckout', text)
+
+    def test_payroll_fills_absen_for_missing_workdays(self):
+        """Tanpa tap → ABSEN (termasuk weekend); LIBUR hanya holiday manual; leave override."""
+        with patch.object(app, 'DB_FILE', self.db):
+            app.init_db()
+            rows = [{
+                'uid': 1, 'nama': 'NICHOLAS',
+                'timestamp': datetime(2026, 5, 1, 8, 0, 0),
+                'punch': 0, 'recovered': False,
+            }, {
+                'uid': 1, 'nama': 'NICHOLAS',
+                'timestamp': datetime(2026, 5, 1, 16, 0, 0),
+                'punch': 1, 'recovered': False,
+            }]
+            app.db_set_leave(1, '2026-05-05', 'cuti')
+            app.db_set_holiday('2026-05-04', 'Libur kantor')  # Mon → LIBUR manual
+            cfg = dict(app.DEFAULT_CONFIG)
+            cfg['user_map'] = {'1': 'NICHOLAS'}
+            data = app.generate_payroll_bytes(rows, cfg, 2026, 5)
+        text = data.decode('utf-8-sig')
+        self.assertIn('ABSEN', text)
+        self.assertIn('LIBUR', text)
+        self.assertIn('CUTI', text)
+        self.assertIn('HADIR', text)
+        # weekend Sat 2026-05-02 → ABSEN (bukan auto-libur)
+        lines_we = [ln for ln in text.splitlines() if '2026-05-02' in ln]
+        self.assertTrue(any('ABSEN' in ln for ln in lines_we), lines_we)
+        # holiday manual Mon 2026-05-04 → LIBUR
+        lines_hol = [ln for ln in text.splitlines() if '2026-05-04' in ln]
+        self.assertTrue(any('LIBUR' in ln for ln in lines_hol), lines_hol)
+        lines_leave = [ln for ln in text.splitlines() if '2026-05-05' in ln]
+        self.assertTrue(any('CUTI' in ln for ln in lines_leave), lines_leave)
+
+    def test_holiday_crud(self):
+        with patch.object(app, 'DB_FILE', self.db):
+            app.init_db()
+            app.db_set_holiday('2026-08-17', 'Kemerdekaan')
+            rows = app.db_list_holidays(2026, 8)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['note'], 'Kemerdekaan')
+            self.assertIn(date(2026, 8, 17), app.db_holiday_set(2026, 8))
+            app.db_delete_holiday('2026-08-17')
+            self.assertEqual(app.db_list_holidays(2026, 8), [])
+
+    def test_month_week_grid_sun_to_sat(self):
+        """May 2026 starts Friday → week rows Sun–Sat; last day is Saturday col."""
+        # one HADIR day May 1
+        day_map = {
+            date(2026, 5, 1): {
+                'status': 'HADIR', 'masuk': '08:00', 'keluar': '16:00',
+            },
+        }
+        weeks = app.build_month_week_grid(2026, 5, day_map, today=date(2026, 5, 31))
+        self.assertGreaterEqual(len(weeks), 4)
+        self.assertLessEqual(len(weeks), 6)
+        for wk in weeks:
+            self.assertEqual(len(wk['days']), 7)
+            # col0 = Sunday, col6 = Saturday
+            self.assertEqual(wk['days'][0]['date'].weekday(), 6)  # Sunday
+            self.assertEqual(wk['days'][6]['date'].weekday(), 5)  # Saturday
+        # May 1 2026 is Friday → in week that starts Apr 26 Sun
+        found = False
+        for wk in weeks:
+            for cell in wk['days']:
+                if cell['date'] == date(2026, 5, 1) and cell['in_month']:
+                    self.assertEqual(cell['status'], 'HADIR')
+                    found = True
+        self.assertTrue(found)
 
 
 if __name__ == '__main__':

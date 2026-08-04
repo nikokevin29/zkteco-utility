@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-ZKTeco eFace10 Utility v4.3 — CV RAJ
+ZKTeco eFace10 Utility — CV RAJ
 Split panel: kiri workflow, kanan viewer + history
 Semua data disimpan di SQLite, tidak ada file temp eksternal
 """
 
-import csv, os, threading, calendar, sqlite3, json, sys, time
+import csv, os, threading, calendar, sqlite3, json, sys, time, urllib.request, urllib.error
+from collections import defaultdict
 from datetime import datetime, date, timedelta
 
 from PySide6.QtWidgets import (
@@ -17,7 +18,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QIcon, QAction, QColor, QFont
 
-APP_VERSION = "5.0.0"
+APP_VERSION = "5.3.1"
 # Frozen exe: data lives next to the exe, NOT next to __file__ (which points
 # into the throwaway _MEIxxxx extraction dir on onefile builds).
 _BASE = (os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
@@ -35,13 +36,31 @@ DEFAULT_CONFIG = {
     "jam_masuk": "08:00", "jam_keluar": "16:00",
     "toleransi": 15, "auto_backup": False,
     "autostart": False, "live_autostart": False,
+    # Silent mode: tray only, Windows login, auto pull+sync
+    "silent_mode": False,
+    "auto_pull_on_start": True,      # pull (+cloud sync) after PC login
+    "auto_pull_interval_min": 60,    # 0=hanya saat start; >0=ulang tiap N menit
     "anomaly_recover": True, "anomaly_anchor": "",
+    # first_last = earliest/latest per day (default face verify)
+    # device_punch = hormati status punch mesin (0=in, 1=out, …)
+    "punch_mode": "first_last",
+    "comm_password": 0,
+    # VST-laravel cloud sync (service.rejekiamerta.com)
+    "cloud_sync_enabled": False,
+    "cloud_api_url": "https://service.rejekiamerta.com/api/attendance",
+    "cloud_api_token": "",
+    "cloud_sync_after_pull": True,
     "user_map": {
         "1":"NICHOLAS","2":"SERLI","3":"TIA","4":"MISRO",
         "5":"LISA","6":"TUR","7":"SLAMET","8":"ARI",
         "9":"REFA","10":"SUKUR","11":"PUGUH"
     }
 }
+
+# ZK punch codes (common on attendance devices)
+PUNCH_IN_CODES = {0, 4}   # check-in, OT-in
+PUNCH_OUT_CODES = {1, 5}  # check-out, OT-out
+LEAVE_TYPES = ('izin', 'cuti', 'dinas', 'sakit')
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ANOMALY (clock-reset) DETECTION & RECOVERY
@@ -58,25 +77,46 @@ def is_anomaly_ts(ts):
 def _sec_of_day(ts):
     return ts.hour*3600 + ts.minute*60 + ts.second
 
-def find_gap_start(normal_recs, fallback=None):
-    """Start date of the LONGEST run of missing days (the outage). A power outage
-    long enough to matter shows up as the biggest gap in the calendar, so the
-    anomaly records are remapped starting there."""
+def find_gaps(normal_recs, min_len=1):
+    """List of (start, length_days) for calendar gaps in normal data, longest first."""
     dates = sorted({r['timestamp'].date() for r in normal_recs if r.get('timestamp')})
     if not dates:
-        return fallback or date(2026, 6, 11)
-    dset = set(dates); d = dates[0]
-    best_start = None; best_len = 0
+        return []
+    dset = set(dates)
+    d = dates[0]
+    gaps = []
     while d <= dates[-1]:
         if d not in dset and (d - timedelta(days=1)) in dset:
-            s = d; n = 0
-            while d not in dset:
-                d += timedelta(days=1); n += 1
-            if n > best_len:
-                best_len = n; best_start = s
+            s = d
+            n = 0
+            while d not in dset and d <= dates[-1] + timedelta(days=1):
+                d += timedelta(days=1)
+                n += 1
+            if n >= min_len:
+                gaps.append((s, n))
         else:
             d += timedelta(days=1)
-    return best_start or (dates[-1] + timedelta(days=1))
+    gaps.sort(key=lambda g: -g[1])
+    return gaps
+
+
+def find_gap_start(normal_recs, fallback=None, min_significant=2):
+    """Start of the longest gap. Softened: if several significant gaps (or none),
+    return None so caller can require a manual anchor instead of guessing."""
+    gaps = find_gaps(normal_recs, min_len=1)
+    if not gaps:
+        if fallback:
+            return fallback
+        # no normal calendar — cannot auto-guess
+        return None
+    significant = [g for g in gaps if g[1] >= min_significant]
+    if len(significant) > 1:
+        # ambiguous: multiple multi-day holes (outage vs holiday/cuti)
+        return None
+    if significant:
+        return significant[0][0]
+    # only 1-day holes — still use longest, but single short gap is OK
+    return gaps[0][0]
 
 def remap_anomalies(anomaly_recs, anchor_date, jam_masuk='08:00', jam_keluar='16:00'):
     """Remap year-2000 records onto consecutive real dates starting at anchor_date
@@ -150,14 +190,15 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS attendance (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         uid INTEGER, nama TEXT,
-        timestamp TEXT UNIQUE,
-        punch INTEGER, pulled_at TEXT
+        timestamp TEXT,
+        punch INTEGER, pulled_at TEXT,
+        recovered INTEGER DEFAULT 0,
+        UNIQUE(uid, timestamp)
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         uid INTEGER PRIMARY KEY, nama TEXT,
         card_id TEXT, updated_at TEXT
     )''')
-    # Pull sessions — history tarikan dari mesin
     c.execute('''CREATE TABLE IF NOT EXISTS pull_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         pulled_at TEXT,
@@ -166,7 +207,6 @@ def init_db():
         device_ip TEXT,
         note TEXT
     )''')
-    # Excel snapshots — disimpan sebagai blob di DB
     c.execute('''CREATE TABLE IF NOT EXISTS excel_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id INTEGER,
@@ -176,36 +216,120 @@ def init_db():
         filter_month INTEGER,
         data BLOB
     )''')
-    conn.commit(); conn.close()
+    c.execute('''CREATE TABLE IF NOT EXISTS leave_days (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uid INTEGER NOT NULL,
+        tanggal TEXT NOT NULL,
+        jenis TEXT NOT NULL,
+        note TEXT DEFAULT '',
+        UNIQUE(uid, tanggal)
+    )''')
+    # Company-wide holidays (manual only — weekend is NOT auto-libur)
+    c.execute('''CREATE TABLE IF NOT EXISTS holidays (
+        tanggal TEXT PRIMARY KEY,
+        note TEXT DEFAULT '',
+        created_at TEXT
+    )''')
+    _migrate_attendance_schema(conn)
+    conn.commit()
+    conn.close()
+
+
+def _migrate_attendance_schema(conn):
+    """Migrate legacy UNIQUE(timestamp) → UNIQUE(uid,timestamp); add recovered col."""
+    c = conn.cursor()
+    cols = {r[1] for r in c.execute('PRAGMA table_info(attendance)')}
+    if not cols:
+        return
+    if 'recovered' not in cols:
+        try:
+            c.execute('ALTER TABLE attendance ADD COLUMN recovered INTEGER DEFAULT 0')
+        except sqlite3.OperationalError:
+            pass
+    # Detect old global unique on timestamp only
+    idx = list(c.execute("PRAGMA index_list(attendance)"))
+    need_rebuild = False
+    for _, name, unique, *_ in idx:
+        if not unique:
+            continue
+        info = list(c.execute(f'PRAGMA index_info("{name}")'))
+        col_names = [r[2] for r in info]
+        if col_names == ['timestamp']:
+            need_rebuild = True
+            break
+    # Also rebuild if no unique on (uid, timestamp)
+    has_pair = False
+    for _, name, unique, *_ in idx:
+        if not unique:
+            continue
+        info = list(c.execute(f'PRAGMA index_info("{name}")'))
+        col_names = [r[2] for r in info]
+        if col_names == ['uid', 'timestamp'] or set(col_names) == {'uid', 'timestamp'}:
+            has_pair = True
+    if not has_pair:
+        need_rebuild = True
+    if not need_rebuild:
+        return
+    c.execute('''CREATE TABLE IF NOT EXISTS attendance_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uid INTEGER, nama TEXT,
+        timestamp TEXT,
+        punch INTEGER, pulled_at TEXT,
+        recovered INTEGER DEFAULT 0,
+        UNIQUE(uid, timestamp)
+    )''')
+    c.execute('''INSERT OR IGNORE INTO attendance_new
+                 (uid, nama, timestamp, punch, pulled_at, recovered)
+                 SELECT uid, nama, timestamp, punch, pulled_at,
+                        COALESCE(recovered, 0) FROM attendance''')
+    c.execute('DROP TABLE attendance')
+    c.execute('ALTER TABLE attendance_new RENAME TO attendance')
+
 
 def db_insert_attendance(rows):
+    """Insert rows. Returns (inserted, skipped_dup)."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     ins = 0
+    skip = 0
     for r in rows:
-        ts = r['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if hasattr(r['timestamp'],'strftime') else str(r['timestamp'])
+        ts = r['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if hasattr(r['timestamp'], 'strftime') else str(r['timestamp'])
+        rec = 1 if r.get('recovered') else 0
         try:
-            c.execute('INSERT INTO attendance (uid,nama,timestamp,punch,pulled_at) VALUES (?,?,?,?,?)',
-                      (r['uid'], r['nama'], ts, r['punch'], now))
+            c.execute(
+                'INSERT INTO attendance (uid,nama,timestamp,punch,pulled_at,recovered) VALUES (?,?,?,?,?,?)',
+                (r['uid'], r['nama'], ts, r.get('punch', 0), now, rec),
+            )
             ins += 1
-        except sqlite3.IntegrityError: pass
-    conn.commit(); conn.close()
-    return ins
+        except sqlite3.IntegrityError:
+            skip += 1
+    conn.commit()
+    conn.close()
+    return ins, skip
+
 
 def db_query_attendance(year=None, month=None):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    q = "SELECT uid,nama,timestamp,punch FROM attendance WHERE strftime('%Y',timestamp)>'2000'"
+    q = ("SELECT uid,nama,timestamp,punch,COALESCE(recovered,0) FROM attendance "
+         "WHERE strftime('%Y',timestamp)>'2000'")
     args = []
-    if year:  q += " AND strftime('%Y',timestamp)=?";  args.append(str(year))
-    if month: q += " AND strftime('%m',timestamp)=?";  args.append(f"{month:02d}")
+    if year:
+        q += " AND strftime('%Y',timestamp)=?"
+        args.append(str(year))
+    if month:
+        q += " AND strftime('%m',timestamp)=?"
+        args.append(f"{month:02d}")
     q += " ORDER BY timestamp"
     c.execute(q, args)
-    rows = [{'uid':r[0],'nama':r[1],
-             'timestamp':datetime.strptime(r[2],'%Y-%m-%d %H:%M:%S'),'punch':r[3]}
-            for r in c.fetchall()]
-    conn.close(); return rows
+    rows = [{
+        'uid': r[0], 'nama': r[1],
+        'timestamp': datetime.strptime(r[2], '%Y-%m-%d %H:%M:%S'),
+        'punch': r[3], 'recovered': bool(r[4]),
+    } for r in c.fetchall()]
+    conn.close()
+    return rows
 
 def db_count():
     conn = sqlite3.connect(DB_FILE)
@@ -280,36 +404,474 @@ def db_delete_excel_snapshot(snap_id):
     c.execute('DELETE FROM excel_snapshots WHERE id=?', (snap_id,))
     conn.commit(); conn.close()
 
-def compute_daily_rows(rows, cfg):
-    """Per-(nama, tanggal) daily summary straight from attendance rows.
-    # ponytail: mirrors generate_excel_bytes math; kept separate so the
-    # heavily-tested excel generator stays untouched"""
+
+# ── Leave (izin / cuti / dinas / sakit) — lokal di absensi.db ────────────────
+def db_set_leave(uid, tanggal, jenis, note=''):
+    jenis = jenis.lower().strip()
+    if jenis not in LEAVE_TYPES:
+        raise ValueError(f'jenis must be one of {LEAVE_TYPES}')
+    tgl = tanggal if isinstance(tanggal, str) else tanggal.strftime('%Y-%m-%d')
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute(
+        'INSERT OR REPLACE INTO leave_days (uid, tanggal, jenis, note) VALUES (?,?,?,?)',
+        (int(uid), tgl, jenis, note or ''),
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_delete_leave(uid, tanggal):
+    tgl = tanggal if isinstance(tanggal, str) else tanggal.strftime('%Y-%m-%d')
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute('DELETE FROM leave_days WHERE uid=? AND tanggal=?', (int(uid), tgl))
+    conn.commit()
+    conn.close()
+
+
+def db_list_leaves(year=None, month=None):
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        q = 'SELECT uid, tanggal, jenis, note FROM leave_days WHERE 1=1'
+        args = []
+        if year:
+            q += " AND strftime('%Y', tanggal)=?"
+            args.append(str(year))
+        if month:
+            q += " AND strftime('%m', tanggal)=?"
+            args.append(f"{month:02d}")
+        q += ' ORDER BY tanggal, uid'
+        rows = conn.execute(q, args).fetchall()
+    except sqlite3.OperationalError:
+        rows = []  # table not migrated yet
+    conn.close()
+    return [{'uid': r[0], 'tanggal': r[1], 'jenis': r[2], 'note': r[3]} for r in rows]
+
+
+def db_leave_map(year=None, month=None):
+    """{(uid, date): jenis}"""
+    m = {}
+    for r in db_list_leaves(year, month):
+        d = datetime.strptime(r['tanggal'], '%Y-%m-%d').date()
+        m[(r['uid'], d)] = r['jenis']
+    return m
+
+
+def db_set_holiday(tanggal, note=''):
+    """Mark a calendar date as company holiday (all employees)."""
+    tgl = tanggal if isinstance(tanggal, str) else tanggal.strftime('%Y-%m-%d')
+    datetime.strptime(tgl, '%Y-%m-%d')  # validate
+    conn = sqlite3.connect(DB_FILE)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    conn.execute(
+        'INSERT OR REPLACE INTO holidays (tanggal, note, created_at) VALUES (?,?,?)',
+        (tgl, note or '', now),
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_delete_holiday(tanggal):
+    tgl = tanggal if isinstance(tanggal, str) else tanggal.strftime('%Y-%m-%d')
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute('DELETE FROM holidays WHERE tanggal=?', (tgl,))
+    conn.commit()
+    conn.close()
+
+
+def db_list_holidays(year=None, month=None):
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        q = 'SELECT tanggal, note FROM holidays WHERE 1=1'
+        args = []
+        if year:
+            q += " AND strftime('%Y', tanggal)=?"
+            args.append(str(year))
+        if month:
+            q += " AND strftime('%m', tanggal)=?"
+            args.append(f'{month:02d}')
+        q += ' ORDER BY tanggal'
+        rows = conn.execute(q, args).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+    return [{'tanggal': r[0], 'note': r[1] or ''} for r in rows]
+
+
+def db_holiday_set(year=None, month=None):
+    """set of date objects marked as holiday."""
+    s = set()
+    for r in db_list_holidays(year, month):
+        s.add(datetime.strptime(r['tanggal'], '%Y-%m-%d').date())
+    return s
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLOUD SYNC → VST-laravel (POST /api/attendance/sync)
+# ─────────────────────────────────────────────────────────────────────────────
+def build_cloud_payload(cfg, punches=None, year=None, month=None):
+    """Build JSON body for VST attendance sync API."""
+    um = cfg.get('user_map') or {}
+    employees = [
+        {'uid': int(k), 'name': str(v)}
+        for k, v in um.items() if str(k).isdigit() and v
+    ]
+    if punches is None:
+        punches = db_query_attendance(year, month)
+    punch_payload = []
+    for r in punches:
+        ts = r['timestamp']
+        if hasattr(ts, 'strftime'):
+            ts = ts.strftime('%Y-%m-%d %H:%M:%S')
+        punch_payload.append({
+            'uid': int(r['uid']),
+            'timestamp': str(ts),
+            'punch': int(r.get('punch') or 0),
+            'nama': r.get('nama') or '',
+            'recovered': bool(r.get('recovered')),
+        })
+    leaves = db_list_leaves(year, month)
+    leave_payload = [
+        {
+            'uid': int(l['uid']),
+            'tanggal': l['tanggal'],
+            'jenis': l['jenis'],
+            'note': l.get('note') or '',
+        }
+        for l in leaves
+    ]
+    holidays = db_list_holidays(year, month)
+    holiday_payload = [
+        {'tanggal': h['tanggal'], 'note': h.get('note') or ''}
+        for h in holidays
+    ]
+    return {
+        'employees': employees,
+        'punches': punch_payload,
+        'leaves': leave_payload,
+        'holidays': holiday_payload,
+    }
+
+
+def cloud_sync(cfg, punches=None, year=None, month=None, log=None):
+    """POST employees + punches + leaves to VST API. Returns result dict or raises."""
+    def _log(msg):
+        if log:
+            log(msg)
+
+    if not cfg.get('cloud_sync_enabled'):
+        raise RuntimeError('Cloud sync disabled (Settings → Cloud Sync).')
+    base = (cfg.get('cloud_api_url') or '').rstrip('/')
+    token = (cfg.get('cloud_api_token') or '').strip()
+    if not base or not token:
+        raise RuntimeError('Cloud API URL / token kosong. Isi di Settings.')
+
+    url = base + '/sync'
+    body = build_cloud_payload(cfg, punches=punches, year=year, month=month)
+    data = json.dumps(body).encode('utf-8')
+    req = urllib.request.Request(
+        url, data=data, method='POST',
+        headers={
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {token}',
+            'User-Agent': f'ZKTeco-Utility/{APP_VERSION}',
+        },
+    )
+    _log(f'☁ Sync → {url}  ({len(body["punches"])} punch, '
+         f'{len(body["employees"])} emp, {len(body["leaves"])} leave, '
+         f'{len(body.get("holidays", []))} libur) ...')
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+            result = json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode('utf-8', errors='replace')[:400]
+        raise RuntimeError(f'HTTP {e.code}: {err_body or e.reason}') from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f'Network: {e.reason}') from e
+
+    _log(
+        f'✓ Cloud sync OK — punches new={result.get("punches_new", "?")} '
+        f'skip={result.get("punches_skipped", "?")} '
+        f'emp={result.get("employees_upserted", "?")} '
+        f'leave={result.get("leaves_upserted", "?")}'
+    )
+    return result
+
+
+def resolve_in_out(taps, punch_mode='first_last'):
+    """From list of (datetime, punch) → (masuk_dt|None, keluar_dt|None, tap_total)."""
+    if not taps:
+        return None, None, 0
+    taps = sorted(taps, key=lambda x: x[0])
+    n = len(taps)
+    if punch_mode == 'device_punch':
+        ins = [t for t, p in taps if int(p) in PUNCH_IN_CODES]
+        outs = [t for t, p in taps if int(p) in PUNCH_OUT_CODES]
+        if not ins and not outs:
+            # device always sends 0 — fall back
+            masuk = taps[0][0]
+            keluar = taps[-1][0] if n > 1 else None
+            return masuk, keluar, n
+        masuk = ins[0] if ins else None
+        keluar = outs[-1] if outs else None
+        return masuk, keluar, n
+    # first_last
+    masuk = taps[0][0]
+    keluar = taps[-1][0] if n > 1 else None
+    return masuk, keluar, n
+
+
+# Payroll week: Sunday → Saturday (payroll cut typically every Saturday)
+WEEKDAY_SUN_FIRST = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu']
+
+
+def sunday_of_week(d):
+    """Calendar date of Sunday that starts the week containing d."""
+    # Python: Mon=0 … Sun=6 → offset to previous/same Sunday
+    return d - timedelta(days=(d.weekday() + 1) % 7)
+
+
+def build_month_week_grid(year, month, day_status_map, today=None):
+    """Build Sun–Sat week rows for one month.
+
+    day_status_map: {date: {'status','masuk','keluar',...}} for ONE employee
+    Returns list of week dicts:
+      {'week': 1, 'label': 'M1 28/07–03/08', 'days': [cell|None × 7]}
+    cell: {date, in_month, status, masuk, keluar, text}
+    """
+    if today is None:
+        today = date.today()
+    first = date(year, month, 1)
+    _, days_in = calendar.monthrange(year, month)
+    last = date(year, month, days_in)
+    start = sunday_of_week(first)
+    end = sunday_of_week(last) + timedelta(days=6)  # Saturday of last week
+    weeks = []
+    w = 0
+    cur = start
+    while cur <= end:
+        w += 1
+        days = []
+        for i in range(7):
+            d = cur + timedelta(days=i)
+            in_month = d.month == month and d.year == year
+            if not in_month:
+                days.append({
+                    'date': d, 'in_month': False, 'status': '',
+                    'masuk': '', 'keluar': '', 'text': '',
+                })
+                continue
+            info = day_status_map.get(d) or {}
+            status = info.get('status', '')
+            masuk = info.get('masuk', '-') or '-'
+            keluar = info.get('keluar', '-') or '-'
+            # future days in month: blank
+            if d > today:
+                text = ''
+                status = ''
+            elif status in ('HADIR', 'TELAT'):
+                text = f'{masuk}\n{keluar}' if keluar != '-' else masuk
+            elif status == 'NO_CHECKOUT':
+                text = f'{masuk}\n—'
+            elif status:
+                text = status
+            else:
+                text = ''
+            days.append({
+                'date': d, 'in_month': True, 'status': status,
+                'masuk': masuk, 'keluar': keluar, 'text': text,
+            })
+        label = (
+            f'M{w} {days[0]["date"].strftime("%d/%m")}'
+            f'–{days[6]["date"].strftime("%d/%m")}'
+        )
+        weeks.append({'week': w, 'label': label, 'days': days})
+        cur += timedelta(days=7)
+    return weeks
+
+
+def build_employee_day_status_map(uid, year, month, rows, cfg, leave_map=None, holiday_set=None):
+    """Full calendar day → status for one uid (fills ABSEN / LIBUR like payroll)."""
+    if leave_map is None:
+        leave_map = db_leave_map(year, month)
+    if holiday_set is None:
+        holiday_set = db_holiday_set(year, month)
+    # filter rows for this uid
+    uid_rows = [r for r in rows if int(r['uid']) == int(uid)]
+    drows = compute_daily_rows(uid_rows, cfg, leave_map)
+    by_day = {}
+    for d in drows:
+        if d['uid'] != int(uid):
+            continue
+        by_day[d['tanggal']] = d
+    _, days_in = calendar.monthrange(year, month)
+    today = date.today()
+    user_map = {int(k): v for k, v in cfg.get('user_map', {}).items()}
+    nama = user_map.get(int(uid), f'UID:{uid}')
+    for day in range(1, days_in + 1):
+        tgl = date(year, month, day)
+        if tgl > today:
+            continue
+        if tgl in by_day:
+            continue
+        # leave-only already in compute_daily_rows; holidays + absen fill
+        leave = leave_map.get((int(uid), tgl), '')
+        if leave:
+            st = leave.upper()
+        elif tgl in holiday_set:
+            st = 'LIBUR'
+        else:
+            st = 'ABSEN'
+        by_day[tgl] = {
+            'uid': int(uid), 'nama': nama, 'tanggal': tgl,
+            'masuk': '-', 'keluar': '-', 'status': st, 'leave': leave,
+        }
+    return by_day
+
+
+def compute_daily_rows(rows, cfg, leave_map=None):
+    """Per-(uid,nama,tanggal) daily summary. Shared by Daily tab, Excel, payroll."""
     user_map = {int(k): v for k, v in cfg.get('user_map', {}).items()}
     std_in = datetime.strptime(cfg.get('jam_masuk', '08:00'), '%H:%M')
+    std_out = datetime.strptime(cfg.get('jam_keluar', '16:00'), '%H:%M')
     tol_dt = std_in + timedelta(minutes=int(cfg.get('toleransi', 15)))
-    raw = {}
+    punch_mode = cfg.get('punch_mode', 'first_last')
+    if leave_map is None:
+        leave_map = {}
+
+    raw = {}  # (uid, nama, tgl) -> list[(ts, punch)]
+    recovered_days = set()
     for r in rows:
         ts = r['timestamp']
         if isinstance(ts, str):
             ts = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
         if ts.year <= ANOMALY_YEAR:
             continue
-        nama = user_map.get(r['uid'], r.get('nama') or f"UID:{r['uid']}")
-        raw.setdefault((nama, ts.date()), []).append(ts)
+        uid = int(r['uid'])
+        nama = user_map.get(uid, r.get('nama') or f"UID:{uid}")
+        key = (uid, nama, ts.date())
+        raw.setdefault(key, []).append((ts, int(r.get('punch') or 0)))
+        if r.get('recovered'):
+            recovered_days.add((uid, ts.date()))
+
     out = []
-    for (nama, tgl), taps in sorted(raw.items(), key=lambda kv: (kv[0][1], kv[0][0])):
-        taps.sort()
-        masuk = taps[0]
-        keluar = taps[-1] if len(taps) > 1 else None
-        t = datetime.strptime(masuk.strftime('%H:%M'), '%H:%M')
-        telat = int((t - std_in).total_seconds() // 60) if t > tol_dt else 0
-        durasi = int((keluar - masuk).total_seconds() // 60) if keluar else 0
-        out.append({'nama': nama, 'tanggal': tgl,
-                    'masuk': masuk.strftime('%H:%M'),
-                    'keluar': keluar.strftime('%H:%M') if keluar else '-',
-                    'telat': telat, 'durasi': durasi,
-                    'weekend': tgl.weekday() >= 5})
+    for (uid, nama, tgl), taps in sorted(raw.items(), key=lambda kv: (kv[0][2], kv[0][1])):
+        masuk, keluar, tap_total = resolve_in_out(taps, punch_mode)
+        no_checkout = masuk is not None and keluar is None
+        telat = 0
+        if masuk:
+            t = datetime.strptime(masuk.strftime('%H:%M'), '%H:%M')
+            telat = int((t - std_in).total_seconds() // 60) if t > tol_dt else 0
+        pulang_cepat = 0
+        if keluar:
+            t = datetime.strptime(keluar.strftime('%H:%M'), '%H:%M')
+            if t < std_out:
+                pulang_cepat = int((std_out - t).total_seconds() // 60)
+        lembur = 0
+        if keluar:
+            t = datetime.strptime(keluar.strftime('%H:%M'), '%H:%M')
+            lembur = int((t - std_out).total_seconds() // 60) if t > std_out else 0
+        durasi = int((keluar - masuk).total_seconds() // 60) if (masuk and keluar) else 0
+        leave = leave_map.get((uid, tgl), '')
+        if leave:
+            status = leave.upper()
+        elif no_checkout:
+            status = 'NO_CHECKOUT'
+        elif telat > 0:
+            status = 'TELAT'
+        else:
+            status = 'HADIR'
+        out.append({
+            'uid': uid, 'nama': nama, 'tanggal': tgl,
+            'masuk': masuk.strftime('%H:%M') if masuk else '-',
+            'keluar': keluar.strftime('%H:%M') if keluar else '-',
+            'telat': telat, 'pulang_cepat': pulang_cepat, 'lembur': lembur,
+            'durasi': durasi, 'tap_total': tap_total,
+            'no_checkout': no_checkout,
+            'recovered': (uid, tgl) in recovered_days,
+            'leave': leave, 'status': status,
+            'weekend': tgl.weekday() >= 5,
+        })
+    # days with leave but no punch
+    seen = {(d['uid'], d['tanggal']) for d in out}
+    for (uid, tgl), jenis in leave_map.items():
+        if (uid, tgl) in seen:
+            continue
+        nama = user_map.get(uid, f'UID:{uid}')
+        out.append({
+            'uid': uid, 'nama': nama, 'tanggal': tgl,
+            'masuk': '-', 'keluar': '-', 'telat': 0, 'pulang_cepat': 0, 'lembur': 0,
+            'durasi': 0, 'tap_total': 0, 'no_checkout': False,
+            'recovered': False, 'leave': jenis, 'status': jenis.upper(),
+            'weekend': tgl.weekday() >= 5,
+        })
+    out.sort(key=lambda d: (d['tanggal'], d['nama']))
     return out
+
+
+def generate_payroll_bytes(rows, cfg, year=None, month=None):
+    """CSV payroll-friendly: one row per employee-day.
+
+    Setiap hari kalender (sampai hari ini) untuk setiap UID di user_map.
+    Sabtu/Minggu BUKAN libur otomatis — libur hanya dari daftar holidays
+    (set manual). Tanpa tap & tanpa izin/cuti/sakit → ABSEN.
+    """
+    leave_map = db_leave_map(year, month)
+    holiday_set = db_holiday_set(year, month)
+    daily = compute_daily_rows(rows, cfg, leave_map)
+    # Overlay: hari libur manual + fill ABSEN untuk hari kosong
+    if year and month:
+        user_map = {int(k): v for k, v in cfg.get('user_map', {}).items()}
+        _, days_in = calendar.monthrange(year, month)
+        # punch days that fall on holiday keep HADIR/etc unless leave
+        for d in daily:
+            if d['tanggal'] in holiday_set and not d.get('leave'):
+                # tetap datang di hari libur → biarkan status hadir; jika ingin flag bisa LEBUR
+                pass
+        have = {(d['uid'], d['tanggal']) for d in daily}
+        for uid, nama in user_map.items():
+            for day in range(1, days_in + 1):
+                tgl = date(year, month, day)
+                if (uid, tgl) in have:
+                    continue
+                if tgl > date.today():
+                    continue
+                # LIBUR hanya jika tanggal di-set manual sebagai hari libur
+                if tgl in holiday_set:
+                    status = 'LIBUR'
+                else:
+                    status = 'ABSEN'
+                daily.append({
+                    'uid': uid, 'nama': nama, 'tanggal': tgl,
+                    'masuk': '-', 'keluar': '-', 'telat': 0, 'pulang_cepat': 0,
+                    'lembur': 0, 'durasi': 0, 'tap_total': 0,
+                    'no_checkout': False, 'recovered': False,
+                    'leave': '', 'status': status, 'weekend': tgl.weekday() >= 5,
+                })
+        daily.sort(key=lambda d: (d['tanggal'], d['nama']))
+
+    import io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([
+        'UID', 'Nama', 'Tanggal', 'Hari', 'Masuk', 'Keluar',
+        'Telat_mnt', 'PulangCepat_mnt', 'Lembur_mnt', 'Durasi_mnt',
+        'Taps', 'NoCheckout', 'Recovered', 'Status',
+    ])
+    hari = HARI_ID
+    for d in daily:
+        w.writerow([
+            d['uid'], d['nama'], d['tanggal'].strftime('%Y-%m-%d'),
+            hari[d['tanggal'].weekday()],
+            d['masuk'], d['keluar'],
+            d['telat'], d['pulang_cepat'], d['lembur'], d['durasi'],
+            d['tap_total'],
+            'Y' if d['no_checkout'] else '',
+            'Y' if d['recovered'] else '',
+            d['status'],
+        ])
+    return buf.getvalue().encode('utf-8-sig')
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EXCEL GENERATOR — returns bytes instead of saving to file
@@ -371,31 +933,51 @@ def generate_excel_bytes(rows, cfg):
                 except: pass
         return None
 
-    _raw = {}
+    punch_mode = cfg.get('punch_mode', 'first_last')
+    # leave map for period (optional — when generating from filtered rows)
+    years = set()
+    months = set()
+    for r in rows:
+        ts = _parse_ts(r.get('timestamp'))
+        if ts and ts.year > 2000:
+            years.add(ts.year); months.add(ts.month)
+    leave_map = {}
+    for y in years:
+        for m in (months or [None]):
+            leave_map.update(db_leave_map(y, m))
+
+    _raw = {}  # (nama, tgl) -> list[(ts, punch, recovered)]
     for r in rows:
         ts = _parse_ts(r['timestamp'])
         if ts is None or ts.year <= 2000: continue
         nama = user_map.get(r['uid'], r.get('nama', f"UID:{r['uid']}"))
         tgl  = ts.date()
-        _raw.setdefault((nama, tgl), []).append(ts)
+        _raw.setdefault((nama, tgl), []).append(
+            (ts, int(r.get('punch') or 0), bool(r.get('recovered'))))
 
-    if not _raw: raise RuntimeError("No data for selected period.")
+    if not _raw and not leave_map:
+        raise RuntimeError("No data for selected period.")
 
     class _Row:
         __slots__ = ['nama','tanggal','masuk','keluar','tap','tap_total',
-                     'jam_masuk','jam_keluar','terlambat','lembur']
+                     'jam_masuk','jam_keluar','terlambat','lembur',
+                     'no_checkout','recovered','status','pulang_cepat']
 
     daily_list = []
     for (nama, tgl), taps in sorted(_raw.items()):
-        taps_s = sorted(taps)
+        pairs = [(t, p) for t, p, _ in taps]
+        masuk, keluar, tap_total = resolve_in_out(pairs, punch_mode)
         row = _Row()
-        row.nama       = nama;   row.tanggal   = tgl
-        row.masuk      = taps_s[0]; row.keluar = taps_s[-1]
-        row.tap        = 2 if len(taps_s)>1 else 1
-        row.tap_total  = len(taps_s)
-        row.jam_masuk  = taps_s[0].strftime('%H:%M')
-        row.jam_keluar = taps_s[-1].strftime('%H:%M') if len(taps_s)>1 else '-'
-        row.terlambat  = 0; row.lembur = 0
+        row.nama = nama; row.tanggal = tgl
+        row.masuk = masuk; row.keluar = keluar
+        row.tap = 2 if (masuk and keluar) else (1 if masuk else 0)
+        row.tap_total = tap_total
+        row.jam_masuk = masuk.strftime('%H:%M') if masuk else '-'
+        row.jam_keluar = keluar.strftime('%H:%M') if keluar else '-'
+        row.terlambat = 0; row.lembur = 0; row.pulang_cepat = 0
+        row.no_checkout = bool(masuk and not keluar)
+        row.recovered = any(rec for _, _, rec in taps)
+        row.status = 'NO_CHECKOUT' if row.no_checkout else 'HADIR'
         daily_list.append(row)
 
     class _DF:
@@ -420,16 +1002,29 @@ def generate_excel_bytes(rows, cfg):
 
     for row in daily:
         try:
-            t = datetime.strptime(row.jam_masuk,'%H:%M')
-            row.terlambat = int((t-std_in).total_seconds()//60) if t>tol_dt else 0
-        except: row.terlambat = 0
-        try:
-            if row.jam_keluar=='-': row.lembur=0
+            if row.jam_masuk == '-':
+                row.terlambat = 0
             else:
-                t = datetime.strptime(row.jam_keluar,'%H:%M')
-                row.lembur = int((t-std_out).total_seconds()//60) if t>std_out else 0
-        except: row.lembur=0
+                t = datetime.strptime(row.jam_masuk, '%H:%M')
+                row.terlambat = int((t - std_in).total_seconds() // 60) if t > tol_dt else 0
+                if row.terlambat > 0 and not row.no_checkout:
+                    row.status = 'TELAT'
+        except Exception:
+            row.terlambat = 0
+        try:
+            if row.jam_keluar == '-':
+                row.lembur = 0
+                row.pulang_cepat = 0
+            else:
+                t = datetime.strptime(row.jam_keluar, '%H:%M')
+                row.lembur = int((t - std_out).total_seconds() // 60) if t > std_out else 0
+                row.pulang_cepat = int((std_out - t).total_seconds() // 60) if t < std_out else 0
+        except Exception:
+            row.lembur = 0
+            row.pulang_cepat = 0
 
+    if len(daily) == 0:
+        raise RuntimeError("No data for selected period.")
     months    = daily.months()
     all_names = daily.names()
     wb = Workbook()
@@ -624,16 +1219,16 @@ def generate_excel_bytes(rows, cfg):
 
     # ── LOG DETAIL ────────────────────────────────────────────────────────────
     wd=wb.create_sheet('Log Detail'); wd.sheet_view.showGridLines=False
-    for i,w in enumerate([5,14,12,10,10,10,8,10,10],1):
-        wd.column_dimensions[get_column_letter(i)].width=w
-    wd.merge_cells('A1:I1')
+    for i, w in enumerate([5,14,12,10,10,10,8,10,10,16], 1):
+        wd.column_dimensions[get_column_letter(i)].width = w
+    wd.merge_cells('A1:J1')
     _lh=('ATTENDANCE LOG DETAIL — CV REJEKI AMERTA JAYA' if lang=='en'
          else 'LOG DETAIL ABSENSI — CV REJEKI AMERTA JAYA')
     wd['A1']=_lh; wd['A1'].font=fnt(12,True,HT); wd['A1'].fill=F(CH); wd['A1'].alignment=C
     wd.row_dimensions[1].height=22
-    _lhdrs=(['No','Name','Date','Day','Check-in','Check-out','Taps','Late','OT']
+    _lhdrs=(['No','Name','Date','Day','Check-in','Check-out','Taps','Late','OT','Flags']
             if lang=='en' else
-            ['No','Nama','Tanggal','Hari','Jam Masuk','Jam Keluar','Tap','Terlambat','Lembur'])
+            ['No','Nama','Tanggal','Hari','Jam Masuk','Jam Keluar','Tap','Terlambat','Lembur','Flag'])
     for i,h in enumerate(_lhdrs,1):
         c=wd.cell(row=2,column=i,value=h)
         c.font=fnt(9,True,HT); c.fill=F(CA); c.alignment=C; c.border=Bs('thin','FF93C5FD')
@@ -644,10 +1239,19 @@ def generate_excel_bytes(rows, cfg):
         dn=DFULL[tgl.weekday()]; bg=F(R1) if i%2==0 else F(R2)
         late=int(row.terlambat); ot=int(row.lembur)
         tap_info=f"{row.tap_total}x" if hasattr(row,'tap_total') else '-'
+        flags = []
+        if getattr(row, 'no_checkout', False):
+            flags.append('NO_CHECKOUT' if lang == 'en' else 'TANPA_KELUAR')
+        if getattr(row, 'recovered', False):
+            flags.append('RECOVERED' if lang == 'en' else 'DIPULIHKAN')
+        if getattr(row, 'pulang_cepat', 0):
+            flags.append(f"EARLY-{row.pulang_cepat}m" if lang == 'en' else f"CEPAT-{row.pulang_cepat}m")
+        flag_s = ', '.join(flags) if flags else '-'
         vals=[i+1,row.nama,tgl.strftime('%d/%m/%Y'),dn,
               row.jam_masuk,row.jam_keluar,tap_info,
               f"{late} min" if late>0 else '-',
-              f"{ot} min"   if ot>0   else '-']
+              f"{ot} min"   if ot>0   else '-',
+              flag_s]
         for col,v in enumerate(vals,1):
             c=wd.cell(row=r3,column=col,value=v)
             c.font=fnt(9,col==2)
@@ -655,8 +1259,16 @@ def generate_excel_bytes(rows, cfg):
             elif col==9 and ot>0: c.font=fnt(9,True,'FF1D4ED8'); c.fill=F('FFE0EAFF')
             elif col==7 and hasattr(row,'tap_total') and row.tap_total>2:
                 c.font=fnt(9,True,'FF6B21A8'); c.fill=F('FFEDE9FE')
+            elif col==10 and flags:
+                c.font=fnt(8,True,RTX); c.fill=F(RBG)
+            elif getattr(row, 'recovered', False):
+                c.fill = F('FFE0E7FF')
             else: c.fill=bg
             c.alignment=C if col!=2 else L; c.border=Bs('thin',BD)
+        if getattr(row, 'no_checkout', False):
+            # highlight checkout cell
+            c6 = wd.cell(row=r3, column=6)
+            c6.font = fnt(9, True, RTX); c6.fill = F(RBG)
         wd.row_dimensions[r3].height=15
 
     ms=[s for s in wb.sheetnames if s not in ('Recap','Rekap','Log Detail')]
@@ -827,10 +1439,12 @@ class SettingsDialog(QDialog):
     def __init__(self, parent, cfg, on_save):
         super().__init__(parent)
         self.setWindowTitle('Settings'); self.setModal(True)
+        self.resize(520, 560)
         self.cfg = cfg; self.on_save = on_save
         lay = QVBoxLayout(self)
         form = QFormLayout()
         fields = [('IP Address','ip'),('Port','port'),
+                  ('Comm password (device)','comm_password'),
                   ('Standard Check-in (HH:MM)','jam_masuk'),
                   ('Standard Check-out (HH:MM)','jam_keluar'),
                   ('Late Tolerance (minutes)','toleransi'),
@@ -840,15 +1454,82 @@ class SettingsDialog(QDialog):
             e = QLineEdit(str(cfg.get(key,'')))
             form.addRow(label, e); self.edits[key] = e
         lay.addLayout(form)
+        # punch mode
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel('In/Out mode:'))
+        self.punch_cb = QComboBox()
+        self.punch_cb.addItem('First/Last tap (face verify)', 'first_last')
+        self.punch_cb.addItem('Forced device punch status', 'device_punch')
+        pm = cfg.get('punch_mode', 'first_last')
+        self.punch_cb.setCurrentIndex(0 if pm != 'device_punch' else 1)
+        prow.addWidget(self.punch_cb); prow.addStretch()
+        lay.addLayout(prow)
+        note = QLabel('Forced mode: uses punch 0/4 = in, 1/5 = out from device.\n'
+                      'If multi-day gaps found during recovery, set anchor date manually.')
+        note.setStyleSheet('color:#888; font-size:8pt;'); lay.addWidget(note)
         self.checks = {}
         for label, key, dflt in [
                 ('Auto backup CSV after pull','auto_backup',False),
                 ('Auto-recover clock-reset (year 2000) records','anomaly_recover',True),
-                ('Start with Windows (minimized to tray)','autostart',False),
                 ('Auto-start Live Monitor + punch notifications','live_autostart',False)]:
             cb = QCheckBox(label); cb.setChecked(bool(cfg.get(key,dflt)))
             lay.addWidget(cb); self.checks[key] = cb
-        # staff names are managed via "Manage Users" (device is the source of truth)
+
+        # Silent mode / autostart
+        silent_box = QGroupBox('Silent Mode (Tray + Auto Pull)')
+        sl = QVBoxLayout(silent_box)
+        self.checks['silent_mode'] = QCheckBox(
+            'Silent mode — jalankan di system tray (tanpa jendela)')
+        self.checks['silent_mode'].setChecked(bool(cfg.get('silent_mode', False)))
+        sl.addWidget(self.checks['silent_mode'])
+        self.checks['autostart'] = QCheckBox(
+            'Start with Windows (login → tray + auto pull)')
+        self.checks['autostart'].setChecked(bool(
+            cfg.get('autostart', False) or cfg.get('silent_mode', False)))
+        sl.addWidget(self.checks['autostart'])
+        self.checks['auto_pull_on_start'] = QCheckBox(
+            'Auto Pull + Sync ke cloud saat PC/app start')
+        self.checks['auto_pull_on_start'].setChecked(bool(cfg.get('auto_pull_on_start', True)))
+        sl.addWidget(self.checks['auto_pull_on_start'])
+        row_iv = QHBoxLayout()
+        row_iv.addWidget(QLabel('Ulangi auto-pull tiap (menit, 0=hanya sekali):'))
+        self.edits['auto_pull_interval_min'] = QLineEdit(str(cfg.get('auto_pull_interval_min', 60)))
+        self.edits['auto_pull_interval_min'].setFixedWidth(60)
+        row_iv.addWidget(self.edits['auto_pull_interval_min'])
+        row_iv.addStretch()
+        sl.addLayout(row_iv)
+        st = QLabel(
+            'Saat Windows nyala: app ke tray → tunggu jaringan → Pull mesin → '
+            'sync VST (jika cloud sync aktif). Tutup jendela = tetap di tray.'
+        )
+        st.setStyleSheet('color:#888; font-size:8pt;')
+        st.setWordWrap(True)
+        sl.addWidget(st)
+        lay.addWidget(silent_box)
+
+        # Cloud Sync → VST-laravel
+        cloud_box = QGroupBox('Cloud Sync (VST Absensi)')
+        cl = QVBoxLayout(cloud_box)
+        self.checks['cloud_sync_enabled'] = QCheckBox('Enable sync to VST-laravel')
+        self.checks['cloud_sync_enabled'].setChecked(bool(cfg.get('cloud_sync_enabled', False)))
+        cl.addWidget(self.checks['cloud_sync_enabled'])
+        self.checks['cloud_sync_after_pull'] = QCheckBox('Auto-sync after every Pull')
+        self.checks['cloud_sync_after_pull'].setChecked(bool(cfg.get('cloud_sync_after_pull', True)))
+        cl.addWidget(self.checks['cloud_sync_after_pull'])
+        cf = QFormLayout()
+        self.edits['cloud_api_url'] = QLineEdit(str(cfg.get(
+            'cloud_api_url', 'https://service.rejekiamerta.com/api/attendance')))
+        self.edits['cloud_api_token'] = QLineEdit(str(cfg.get('cloud_api_token', '')))
+        self.edits['cloud_api_token'].setEchoMode(QLineEdit.Password)
+        self.edits['cloud_api_token'].setPlaceholderText('Token dari Admin → Absensi Karyawan')
+        cf.addRow('API Base URL', self.edits['cloud_api_url'])
+        cf.addRow('API Token', self.edits['cloud_api_token'])
+        cl.addLayout(cf)
+        tip = QLabel('Token digenerate di web: Absensi Karyawan → Generate Token.\n'
+                     'URL default: https://service.rejekiamerta.com/api/attendance')
+        tip.setStyleSheet('color:#888; font-size:8pt;'); cl.addWidget(tip)
+        lay.addWidget(cloud_box)
+
         btns = QHBoxLayout()
         ok = QPushButton('💾 Save'); ok.setProperty('accent', True); ok.clicked.connect(self._save)
         cancel = QPushButton('Cancel'); cancel.clicked.connect(self.reject)
@@ -858,12 +1539,16 @@ class SettingsDialog(QDialog):
     def _save(self):
         for key, e in self.edits.items():
             v = e.text().strip()
-            if key == 'toleransi':
+            if key in ('toleransi', 'comm_password', 'port', 'auto_pull_interval_min'):
                 try: v = int(v)
                 except ValueError: pass
             self.cfg[key] = v
+        self.cfg['punch_mode'] = self.punch_cb.currentData()
         for key, cb in self.checks.items():
             self.cfg[key] = cb.isChecked()
+        # silent mode implies autostart for hands-off operation
+        if self.cfg.get('silent_mode'):
+            self.cfg['autostart'] = True
         save_config(self.cfg)
         self.on_save(self.cfg)
         self.accept()
@@ -944,6 +1629,167 @@ class UserManagerDialog(QDialog):
         if self.app: self.app.device_user_delete(uid, self)
 
 
+class LeaveDialog(QDialog):
+    """Manage izin / cuti / dinas / sakit per employee-day (local SQLite)."""
+    def __init__(self, parent, cfg):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.setWindowTitle('Izin / Cuti / Dinas / Sakit')
+        self.setModal(True)
+        self.resize(520, 420)
+        lay = QVBoxLayout(self)
+        form = QHBoxLayout()
+        form.addWidget(QLabel('UID:'))
+        self.uid_edit = QLineEdit(); self.uid_edit.setFixedWidth(50); form.addWidget(self.uid_edit)
+        form.addWidget(QLabel('Tanggal (YYYY-MM-DD):'))
+        self.date_edit = QLineEdit(date.today().strftime('%Y-%m-%d')); form.addWidget(self.date_edit)
+        form.addWidget(QLabel('Jenis:'))
+        self.jenis_cb = QComboBox(); self.jenis_cb.addItems(list(LEAVE_TYPES)); form.addWidget(self.jenis_cb)
+        form.addWidget(QLabel('Catatan:'))
+        self.note_edit = QLineEdit(); form.addWidget(self.note_edit)
+        b_add = QPushButton('➕ Simpan'); b_add.clicked.connect(self._add); form.addWidget(b_add)
+        lay.addLayout(form)
+        self.table = _mk_table(['UID', 'Nama', 'Tanggal', 'Jenis', 'Catatan'], [50, 120, 100, 70, 140], stretch_col=4)
+        lay.addWidget(self.table, 1)
+        row = QHBoxLayout()
+        b_del = QPushButton('🗑 Hapus baris terpilih'); b_del.clicked.connect(self._del)
+        b_close = QPushButton('Close'); b_close.clicked.connect(self.accept)
+        row.addWidget(b_del); row.addStretch(); row.addWidget(b_close)
+        lay.addLayout(row)
+        self._reload()
+
+    def _reload(self):
+        um = {int(k): v for k, v in self.cfg.get('user_map', {}).items()}
+        rows = db_list_leaves()
+        _fill_table(self.table, [
+            (r['uid'], um.get(r['uid'], f"UID:{r['uid']}"), r['tanggal'], r['jenis'], r['note'])
+            for r in rows
+        ])
+
+    def _add(self):
+        uid = self.uid_edit.text().strip()
+        tgl = self.date_edit.text().strip()
+        if not uid.isdigit():
+            QMessageBox.warning(self, 'Invalid', 'UID harus angka.'); return
+        try:
+            datetime.strptime(tgl, '%Y-%m-%d')
+        except ValueError:
+            QMessageBox.warning(self, 'Invalid', 'Tanggal harus YYYY-MM-DD.'); return
+        db_set_leave(int(uid), tgl, self.jenis_cb.currentText(), self.note_edit.text().strip())
+        self._reload()
+
+    def _del(self):
+        r = self.table.currentRow()
+        if r < 0: return
+        uid = int(self.table.item(r, 0).text())
+        tgl = self.table.item(r, 2).text()
+        db_delete_leave(uid, tgl)
+        self._reload()
+
+
+class HolidayDialog(QDialog):
+    """Set company-wide holiday dates (manual). Weekend is NOT auto-libur."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle('Hari Libur (Manual)')
+        self.setModal(True)
+        self.resize(480, 400)
+        lay = QVBoxLayout(self)
+        tip = QLabel(
+            'Sabtu/Minggu TIDAK otomatis libur.\n'
+            'Set tanggal libur event (nasional / cuti bersama / libur kantor) di bawah.'
+        )
+        tip.setStyleSheet('color:#555; font-size:9pt;')
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        form = QHBoxLayout()
+        form.addWidget(QLabel('Tanggal (YYYY-MM-DD):'))
+        self.date_edit = QLineEdit(date.today().strftime('%Y-%m-%d'))
+        self.date_edit.setFixedWidth(110)
+        form.addWidget(self.date_edit)
+        form.addWidget(QLabel('Keterangan:'))
+        self.note_edit = QLineEdit()
+        self.note_edit.setPlaceholderText('mis. Idul Fitri, cuti bersama…')
+        form.addWidget(self.note_edit, 1)
+        lay.addLayout(form)
+
+        self.confirm_cb = QCheckBox(
+            'Saya konfirmasi tanggal ini adalah HARI LIBUR untuk semua karyawan'
+        )
+        lay.addWidget(self.confirm_cb)
+
+        b_add = QPushButton('➕ Tetapkan sebagai Hari Libur')
+        b_add.setProperty('accent', True)
+        b_add.clicked.connect(self._add)
+        lay.addWidget(b_add)
+
+        self.table = _mk_table(['Tanggal', 'Hari', 'Keterangan'], [110, 80, 220], stretch_col=2)
+        lay.addWidget(self.table, 1)
+
+        row = QHBoxLayout()
+        b_del = QPushButton('🗑 Hapus libur terpilih')
+        b_del.clicked.connect(self._del)
+        b_close = QPushButton('Close')
+        b_close.clicked.connect(self.accept)
+        row.addWidget(b_del)
+        row.addStretch()
+        row.addWidget(b_close)
+        lay.addLayout(row)
+        self._reload()
+
+    def _reload(self):
+        rows = db_list_holidays()
+        data = []
+        for r in rows:
+            try:
+                d = datetime.strptime(r['tanggal'], '%Y-%m-%d').date()
+                hari = HARI_ID[d.weekday()]
+            except Exception:
+                hari = ''
+            data.append((r['tanggal'], hari, r['note']))
+        _fill_table(self.table, data)
+
+    def _add(self):
+        tgl = self.date_edit.text().strip()
+        try:
+            d = datetime.strptime(tgl, '%Y-%m-%d').date()
+        except ValueError:
+            QMessageBox.warning(self, 'Invalid', 'Tanggal harus YYYY-MM-DD.')
+            return
+        if not self.confirm_cb.isChecked():
+            QMessageBox.warning(
+                self, 'Konfirmasi',
+                'Centang checklist konfirmasi dulu sebelum menetapkan hari libur.'
+            )
+            return
+        note = self.note_edit.text().strip()
+        if QMessageBox.question(
+            self, 'Konfirmasi Hari Libur',
+            f'Tetapkan {tgl} ({HARI_ID[d.weekday()]}) sebagai HARI LIBUR?\n\n'
+            f'Keterangan: {note or "(kosong)"}\n\n'
+            f'Semua karyawan tanpa izin/cuti akan berstatus LIBUR (bukan ABSEN).'
+        ) != QMessageBox.Yes:
+            return
+        db_set_holiday(tgl, note)
+        self.confirm_cb.setChecked(False)
+        self.note_edit.clear()
+        self._reload()
+        QMessageBox.information(self, 'OK', f'{tgl} diset sebagai hari libur.')
+
+    def _del(self):
+        r = self.table.currentRow()
+        if r < 0:
+            return
+        tgl = self.table.item(r, 0).text()
+        if QMessageBox.question(
+            self, 'Hapus', f'Hapus {tgl} dari daftar hari libur?'
+        ) != QMessageBox.Yes:
+            return
+        db_delete_holiday(tgl)
+        self._reload()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN WINDOW
 # ─────────────────────────────────────────────────────────────────────────────
@@ -975,41 +1821,121 @@ class App(QMainWindow):
             from updater import cleanup_old_exe
             cleanup_old_exe()
         except ImportError: pass
+        self._boot_silent = (
+            '--silent' in sys.argv
+            or '--minimized' in sys.argv
+            or bool(self.cfg.get('silent_mode', False) and '--show' not in sys.argv)
+        )
+        # only force silent hide when launched with flag (Windows autostart)
+        self._boot_silent_flag = '--silent' in sys.argv or '--minimized' in sys.argv
         self._tray_setup()
         if self.cfg.get('live_autostart', False):
             QTimer.singleShot(1500, self._toggle_live)
         self._clock_timer = QTimer(self)
         self._clock_timer.timeout.connect(self._clock_tick)
         self._clock_timer.start(600_000)   # background clock guard, every 10 min
+        self._setup_auto_pull_schedule()
 
     # ── System tray ───────────────────────────────────────────────────────────
     def _tray_setup(self):
         self._tray = None
-        if not QSystemTrayIcon.isSystemTrayAvailable(): return
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
         self._tray = QSystemTrayIcon(_icon(), self)
-        self._tray.setToolTip('ZKTeco Utility')
+        self._tray.setToolTip(f'ZKTeco Utility v{APP_VERSION}')
         menu = QMenu()
-        a_open = QAction('Open Dashboard', menu); a_open.triggered.connect(self._tray_open)
-        a_exit = QAction('Exit', menu); a_exit.triggered.connect(self._tray_exit)
-        menu.addAction(a_open); menu.addSeparator(); menu.addAction(a_exit)
+        a_open = QAction('Open Dashboard', menu)
+        a_open.triggered.connect(self._tray_open)
+        a_pull = QAction('Pull + Sync Now', menu)
+        a_pull.triggered.connect(lambda: self._run_quiet(lambda: self._do_pull(quiet=True)))
+        a_sync = QAction('Sync to VST Cloud', menu)
+        a_sync.triggered.connect(lambda: self._run_quiet(self._do_cloud_sync_quiet))
+        a_exit = QAction('Exit', menu)
+        a_exit.triggered.connect(self._tray_exit)
+        menu.addAction(a_open)
+        menu.addSeparator()
+        menu.addAction(a_pull)
+        menu.addAction(a_sync)
+        menu.addSeparator()
+        menu.addAction(a_exit)
         self._tray.setContextMenu(menu)
         self._tray.activated.connect(
             lambda reason: self._tray_open() if reason == QSystemTrayIcon.Trigger else None)
         self._tray.show()
 
     def closeEvent(self, ev):
-        if self._tray:   # keep running: live monitor + clock guard stay on
-            ev.ignore(); self.hide()
+        # always prefer tray when available (silent mode)
+        if self._tray:
+            ev.ignore()
+            self.hide()
+            if self.cfg.get('silent_mode') or self._boot_silent_flag:
+                self._tray_msg(
+                    'ZKTeco Utility',
+                    'Berjalan di tray. Klik kanan ikon → Open / Exit.',
+                    QSystemTrayIcon.Information,
+                )
         else:
             ev.accept()
 
     def _tray_open(self):
-        self.showNormal(); self.raise_(); self.activateWindow()
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
 
     def _tray_exit(self):
         self._live_want = False
-        if self._tray: self._tray.hide()
+        if getattr(self, '_pull_timer', None):
+            self._pull_timer.stop()
+        if self._tray:
+            self._tray.hide()
         QApplication.quit()
+
+    def _tray_msg(self, title, msg, icon=None):
+        if icon is None:
+            icon = QSystemTrayIcon.Information
+        if self._tray:
+            try:
+                self._tray.showMessage(title, msg, icon, 6000)
+            except Exception:
+                pass
+
+    def _setup_auto_pull_schedule(self):
+        """Boot auto-pull + optional interval while running in tray."""
+        self._pull_timer = None
+        if self.cfg.get('auto_pull_on_start', True) and self._boot_silent_flag:
+            # delay: wait NIC/device after Windows login
+            delay_ms = 12_000
+            self._log(f'Silent: auto pull+sync in {delay_ms // 1000}s ...')
+            QTimer.singleShot(delay_ms, self._startup_auto_pull)
+            if self._tray:
+                QTimer.singleShot(
+                    500,
+                    lambda: self._tray_msg(
+                        'ZKTeco Silent',
+                        'Siap di tray. Auto pull sebentar lagi…',
+                    ),
+                )
+        try:
+            mins = int(self.cfg.get('auto_pull_interval_min', 0) or 0)
+        except (TypeError, ValueError):
+            mins = 0
+        if mins > 0:
+            self._pull_timer = QTimer(self)
+            self._pull_timer.timeout.connect(self._startup_auto_pull)
+            self._pull_timer.start(mins * 60 * 1000)
+            self._log(f'Auto-pull interval: setiap {mins} menit')
+
+    def _startup_auto_pull(self):
+        self._log('▶ Auto pull (silent) ...')
+        self._run_quiet(lambda: self._do_pull(quiet=True))
+
+    def _do_cloud_sync_quiet(self):
+        try:
+            cloud_sync(self.cfg, punches=None, log=self._log)
+            self.ui(lambda: self._tray_msg('Cloud Sync', 'Sync ke VST berhasil.'))
+        except Exception as e:
+            self._log(f'⚠ Cloud sync gagal: {e}')
+            self.ui(lambda: self._tray_msg('Cloud Sync', str(e), QSystemTrayIcon.Warning))
 
     def _clock_tick(self):
         """Every 10 min: make sure the device clock matches the PC (power-loss guard).
@@ -1111,8 +2037,17 @@ class App(QMainWindow):
         b_clear = QPushButton('🗑 Clear Device Log'); b_clear.clicked.connect(self._confirm_clear)
         sc.addWidget(self.btn_all); sc.addWidget(b_clear)
         wl.addLayout(sc, 5, 0, 1, 2)
+        sc2 = QHBoxLayout()
+        b_leave = QPushButton('📋 Izin/Cuti/Dinas/Sakit'); b_leave.clicked.connect(self._open_leave)
+        b_pay = QPushButton('💰 Export Payroll CSV'); b_pay.clicked.connect(self._export_payroll)
+        sc2.addWidget(b_leave); sc2.addWidget(b_pay)
+        wl.addLayout(sc2, 6, 0, 1, 2)
+        b_hol = QPushButton('🏖 Hari Libur (Manual)'); b_hol.clicked.connect(self._open_holiday)
+        wl.addWidget(b_hol, 7, 0, 1, 2)
+        b_cloud = QPushButton('☁ Sync to VST Cloud'); b_cloud.clicked.connect(lambda: self._run(self._do_cloud_sync))
+        wl.addWidget(b_cloud, 8, 0, 1, 2)
         self.data_lbl = QLabel('...'); self.data_lbl.setStyleSheet('color:#1e40af; font-size:8pt;')
-        wl.addWidget(self.data_lbl, 6, 0, 1, 2, alignment=Qt.AlignCenter)
+        wl.addWidget(self.data_lbl, 9, 0, 1, 2, alignment=Qt.AlignCenter)
         ll.addWidget(gw)
 
         # Log card
@@ -1205,10 +2140,49 @@ class App(QMainWindow):
         b_dload.clicked.connect(self._refresh_daily); drow.addWidget(b_dload)
         drow.addStretch()
         dl.addLayout(drow)
-        self.daily_tbl = _mk_table(['Nama','Tanggal','Masuk','Keluar','Telat (mnt)','Durasi'],
-                                   [150,95,70,70,90,90], stretch_col=0)
+        self.daily_tbl = _mk_table(
+            ['Nama', 'Tanggal', 'Masuk', 'Keluar', 'Telat', 'Durasi', 'Status'],
+            [130, 90, 60, 60, 55, 70, 100], stretch_col=0)
         dl.addWidget(self.daily_tbl, 1)
         self.tabs.addTab(tab_daily, '📅 Daily')
+
+        # Tab 4: Weekly grid (Sun–Sat rows × ~4 weeks) — payroll-oriented
+        tab_week = QWidget(); wkl = QVBoxLayout(tab_week)
+        wrow = QHBoxLayout()
+        wrow.addWidget(QLabel('Bulan:'))
+        self.week_bulan = QComboBox(); self.week_bulan.addItems([str(i) for i in range(1, 13)])
+        self.week_bulan.setCurrentText(str(now.month)); wrow.addWidget(self.week_bulan)
+        wrow.addWidget(QLabel('Tahun:'))
+        self.week_tahun = QComboBox()
+        self.week_tahun.addItems([str(y) for y in range(now.year - 3, now.year + 2)])
+        self.week_tahun.setCurrentText(str(now.year)); wrow.addWidget(self.week_tahun)
+        wrow.addWidget(QLabel('Karyawan:'))
+        self.week_emp = QComboBox(); wrow.addWidget(self.week_emp, 1)
+        b_wload = QPushButton('🔍 Load'); b_wload.setProperty('accent', True)
+        b_wload.clicked.connect(self._refresh_weekly); wrow.addWidget(b_wload)
+        wkl.addLayout(wrow)
+        tip_w = QLabel(
+            'Skema payroll: baris = minggu (Minggu→Sabtu), ~4 baris / bulan. '
+            'Cut-off biasanya hari Sabtu.'
+        )
+        tip_w.setStyleSheet('color:#888; font-size:8pt;'); tip_w.setWordWrap(True)
+        wkl.addWidget(tip_w)
+        self.week_tbl = QTableWidget()
+        self.week_tbl.setColumnCount(8)
+        self.week_tbl.setHorizontalHeaderLabels(
+            ['Minggu'] + WEEKDAY_SUN_FIRST)
+        self.week_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.week_tbl.verticalHeader().setVisible(False)
+        self.week_tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.week_tbl.setSelectionMode(QAbstractItemView.NoSelection)
+        wkl.addWidget(self.week_tbl, 1)
+        self.week_legend = QLabel(
+            'H = Hadir (jam) · A = ABSEN · L = LIBUR · I/C/D/S = izin/cuti/dinas/sakit · NC = no checkout'
+        )
+        self.week_legend.setStyleSheet('color:#666; font-size:8pt;')
+        wkl.addWidget(self.week_legend)
+        self.tabs.addTab(tab_week, '🗓 Minggu–Sabtu')
+        self._fill_week_emp_combo()
 
         # Status bar
         self.statusBar().showMessage('Ready.')
@@ -1242,31 +2216,195 @@ class App(QMainWindow):
         today = date.today()
         rows = [r for r in db_query_attendance(today.year, today.month)
                 if r['timestamp'].date() == today]
-        drows = compute_daily_rows(rows, self.cfg)
+        leave_map = db_leave_map(today.year, today.month)
+        drows = compute_daily_rows(rows, self.cfg, leave_map)
         data, colors = [], []
         for d in drows:
-            status = f"Telat {d['telat']}m" if d['telat'] else 'Hadir'
+            if d['leave']:
+                status = d['status']
+                colors.append('#DBEAFE')
+            elif d['no_checkout']:
+                status = 'Tanpa keluar'
+                colors.append('#FEE2E2')
+            elif d['telat']:
+                status = f"Telat {d['telat']}m"
+                colors.append('#FED7AA')
+            else:
+                status = 'Hadir'
+                colors.append('#D1FAE5')
+            if d['recovered']:
+                status += ' ★'
             data.append((d['nama'], d['masuk'], status))
-            colors.append('#FED7AA' if d['telat'] else '#D1FAE5')
         _fill_table(self.today_tbl, data, colors)
-        telat = sum(1 for d in drows if d['telat'])
-        hadir = len(drows) - telat
-        absen = max(len(self.cfg.get('user_map',{})) - len(drows), 0)
+        telat = sum(1 for d in drows if d['telat'] and not d['leave'])
+        hadir = sum(1 for d in drows if d['status'] in ('HADIR', 'TELAT', 'NO_CHECKOUT'))
+        absen = max(len(self.cfg.get('user_map', {})) - hadir, 0)
         self.tile_hadir.setText(str(hadir))
         self.tile_telat.setText(str(telat))
         self.tile_absen.setText(str(absen))
 
+    def _fill_week_emp_combo(self):
+        if not hasattr(self, 'week_emp'):
+            return
+        cur = self.week_emp.currentData()
+        self.week_emp.blockSignals(True)
+        self.week_emp.clear()
+        self.week_emp.addItem('— Semua (ringkas) —', 0)
+        for k, v in sorted(self.cfg.get('user_map', {}).items(), key=lambda x: int(x[0])):
+            self.week_emp.addItem(f'{k} · {v}', int(k))
+        if cur is not None:
+            idx = self.week_emp.findData(cur)
+            if idx >= 0:
+                self.week_emp.setCurrentIndex(idx)
+        self.week_emp.blockSignals(False)
+
+    def _cell_bg_for_status(self, status):
+        s = (status or '').upper()
+        if s in ('HADIR', 'TELAT'):
+            return QColor('#D1FAE5')
+        if s == 'NO_CHECKOUT':
+            return QColor('#FEE2E2')
+        if s == 'ABSEN':
+            return QColor('#FECACA')
+        if s == 'LIBUR':
+            return QColor('#E0E7FF')
+        if s in ('IZIN', 'CUTI', 'DINAS', 'SAKIT'):
+            return QColor('#DBEAFE')
+        return None
+
+    def _refresh_weekly(self):
+        y = int(self.week_tahun.currentText())
+        m = int(self.week_bulan.currentText())
+        uid = self.week_emp.currentData()
+        rows = db_query_attendance(y, m)
+        leave_map = db_leave_map(y, m)
+        holiday_set = db_holiday_set(y, m)
+        um = {int(k): v for k, v in self.cfg.get('user_map', {}).items()}
+
+        if uid and int(uid) != 0:
+            uids = [int(uid)]
+        else:
+            uids = sorted(um.keys())
+
+        # Build table: for multi-employee, stack grids with name header rows
+        all_rows_data = []  # list of (is_header, label, cells)
+        for u in uids:
+            day_map = build_employee_day_status_map(
+                u, y, m, rows, self.cfg, leave_map, holiday_set)
+            weeks = build_month_week_grid(y, m, day_map)
+            nama = um.get(u, f'UID:{u}')
+            if len(uids) > 1:
+                all_rows_data.append(('header', f'{u} · {nama}', None))
+            for wk in weeks:
+                all_rows_data.append(('week', wk['label'], wk['days']))
+
+        self.week_tbl.clearContents()
+        self.week_tbl.clearSpans()
+        self.week_tbl.setRowCount(len(all_rows_data))
+        for r, (kind, label, days) in enumerate(all_rows_data):
+            if kind == 'header':
+                self.week_tbl.setSpan(r, 0, 1, 8)
+                it = QTableWidgetItem(label)
+                f = it.font(); f.setBold(True); it.setFont(f)
+                it.setBackground(QColor('#EEF2FF'))
+                self.week_tbl.setItem(r, 0, it)
+                self.week_tbl.setRowHeight(r, 22)
+                continue
+            lab = QTableWidgetItem(label)
+            lab.setBackground(QColor('#F3F4F6'))
+            self.week_tbl.setItem(r, 0, lab)
+            for c, cell in enumerate(days):
+                if not cell.get('in_month'):
+                    it = QTableWidgetItem('')
+                    it.setBackground(QColor('#F9FAFB'))
+                else:
+                    st = cell.get('status') or ''
+                    txt = cell.get('text') or ''
+                    # compact single-line for multi view
+                    if '\n' in txt:
+                        txt = txt.replace('\n', ' ')
+                    it = QTableWidgetItem(txt if txt else st)
+                    it.setTextAlignment(Qt.AlignCenter)
+                    it.setToolTip(
+                        f"{cell['date'].strftime('%Y-%m-%d')} · {st}\n"
+                        f"Masuk {cell.get('masuk','-')}  Keluar {cell.get('keluar','-')}"
+                    )
+                    bg = self._cell_bg_for_status(st)
+                    if bg:
+                        it.setBackground(bg)
+                    if not cell.get('in_month'):
+                        pass
+                self.week_tbl.setItem(r, c + 1, it)
+            self.week_tbl.setRowHeight(r, 36 if len(uids) == 1 else 28)
+        self._log(f'Weekly grid: {m}/{y} · {len(uids)} karyawan · {len(all_rows_data)} baris')
+
     def _refresh_daily(self):
         y = int(self.daily_tahun.currentText()); m = int(self.daily_bulan.currentText())
-        drows = compute_daily_rows(db_query_attendance(y, m), self.cfg)
+        leave_map = db_leave_map(y, m)
+        drows = compute_daily_rows(db_query_attendance(y, m), self.cfg, leave_map)
         data, colors = [], []
         for d in drows:
             dur = f"{d['durasi']//60}j {d['durasi']%60}m" if d['durasi'] else '-'
+            st = d['status']
+            if d['recovered']:
+                st += ' ★'
             data.append((d['nama'], d['tanggal'].strftime('%d-%m-%Y'), d['masuk'],
-                         d['keluar'], d['telat'] or '-', dur))
-            colors.append('#FEF9C3' if d['weekend'] else ('#FED7AA' if d['telat'] else None))
+                         d['keluar'], d['telat'] or '-', dur, st))
+            if d['leave']:
+                colors.append('#DBEAFE')
+            elif d['no_checkout']:
+                colors.append('#FEE2E2')
+            elif d['recovered']:
+                colors.append('#E0E7FF')
+            elif d['telat']:
+                colors.append('#FED7AA')
+            elif d['weekend']:
+                colors.append('#FEF9C3')
+            else:
+                colors.append(None)
         _fill_table(self.daily_tbl, data, colors)
         self._log(f'Daily view: {len(drows)} baris untuk {m}/{y}')
+
+    def _open_leave(self):
+        LeaveDialog(self, self.cfg).exec()
+        self._refresh_today()
+        if self.tabs.currentIndex() == 3:
+            self._refresh_daily()
+
+    def _open_holiday(self):
+        HolidayDialog(self).exec()
+
+    def _export_payroll(self):
+        yr = int(self.tahun_cb.currentText())
+        bln = self.bulan_cb.currentText()
+        _month_list = ['All', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                       'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        mo = _month_list.index(bln) if bln != 'All' else None
+        if self.src_cache.isChecked():
+            if not self._cache:
+                QMessageBox.warning(self, 'Payroll', 'No cache. Pull data first.'); return
+            rows = list(self._cache)
+        else:
+            rows = db_query_attendance(yr, mo)
+        if mo:
+            rows = [r for r in rows
+                    if r['timestamp'].month == mo and r['timestamp'].year == yr]
+        if not rows and not db_list_leaves(yr, mo):
+            QMessageBox.warning(self, 'Payroll', 'No data for selected period.'); return
+        try:
+            data = generate_payroll_bytes(rows, self.cfg, yr, mo)
+        except Exception as e:
+            QMessageBox.critical(self, 'Payroll', str(e)); return
+        period = f'{bln}_{yr}' if bln != 'All' else f'All_{yr}'
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Export Payroll CSV',
+            f'Payroll_CVRAJ_{period}_{datetime.now().strftime("%Y%m%d")}.csv',
+            'CSV (*.csv)')
+        if path:
+            with open(path, 'wb') as f:
+                f.write(data)
+            self._log(f'✓ Payroll CSV → {path}')
+            _open_path(os.path.dirname(path))
 
     # ── UI helpers ────────────────────────────────────────────────────────────
     def _log(self, msg):
@@ -1278,21 +2416,35 @@ class App(QMainWindow):
 
     def _get_conn(self):
         from zk import ZK
+        try:
+            pw = int(self.cfg.get('comm_password', 0) or 0)
+        except (TypeError, ValueError):
+            pw = 0
         return ZK(self.ip_edit.text().strip(), port=int(self.port_edit.text()),
-                  timeout=15, password=0, force_udp=False, ommit_ping=False).connect()
+                  timeout=15, password=pw, force_udp=False, ommit_ping=False).connect()
 
     def _set_buttons(self, enabled):
         for b in self._btns: b.setEnabled(enabled)
 
     def _run(self, fn):
         self._set_buttons(False)
-        threading.Thread(target=self._worker, args=(fn,), daemon=True).start()
+        threading.Thread(target=self._worker, args=(fn, False), daemon=True).start()
 
-    def _worker(self, fn):
-        try: fn()
+    def _run_quiet(self, fn):
+        """Background job without modal error dialogs (tray + log only)."""
+        self._set_buttons(False)
+        threading.Thread(target=self._worker, args=(fn, True), daemon=True).start()
+
+    def _worker(self, fn, quiet=False):
+        try:
+            fn()
         except Exception as e:
             self._log(f'[ERROR] {e}')
-            self.ui(lambda e=e: QMessageBox.critical(self, 'Error', str(e)))
+            if quiet:
+                self.ui(lambda e=e: self._tray_msg(
+                    'ZKTeco Error', str(e), QSystemTrayIcon.Warning))
+            else:
+                self.ui(lambda e=e: QMessageBox.critical(self, 'Error', str(e)))
         finally:
             self.ui(lambda: self._set_buttons(True))
             self.ui(self._update_status)
@@ -1306,26 +2458,51 @@ class App(QMainWindow):
             self.cfg = new_cfg
             self.ip_edit.setText(new_cfg['ip'])
             self.port_edit.setText(str(new_cfg['port']))
-            self._apply_autostart(new_cfg.get('autostart', False))
+            enable = bool(new_cfg.get('autostart') or new_cfg.get('silent_mode'))
+            self._apply_autostart(enable)
+            # reschedule interval
+            if getattr(self, '_pull_timer', None):
+                self._pull_timer.stop()
+                self._pull_timer = None
+            try:
+                mins = int(new_cfg.get('auto_pull_interval_min', 0) or 0)
+            except (TypeError, ValueError):
+                mins = 0
+            if mins > 0:
+                self._pull_timer = QTimer(self)
+                self._pull_timer.timeout.connect(self._startup_auto_pull)
+                self._pull_timer.start(mins * 60 * 1000)
+                self._log(f'Auto-pull interval: setiap {mins} menit')
             self._log('✓ Settings saved')
         SettingsDialog(self, self.cfg, on_save).exec()
 
     def _apply_autostart(self, enable):
-        """Register/unregister the exe in HKCU Run so it launches at Windows login."""
-        if sys.platform != 'win32': return
+        """Register/unregister in HKCU Run — launches with --silent at login."""
+        if sys.platform != 'win32':
+            return
         import winreg
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                r'Software\Microsoft\Windows\CurrentVersion\Run', 0, winreg.KEY_SET_VALUE)
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r'Software\Microsoft\Windows\CurrentVersion\Run',
+                0, winreg.KEY_SET_VALUE,
+            )
             if enable:
-                if not getattr(sys, 'frozen', False):
-                    self._log('⚠ Autostart only works from the built .exe, not from .py'); return
-                winreg.SetValueEx(key, 'ZKTeco_Utility', 0, winreg.REG_SZ,
-                                  f'"{sys.executable}" --minimized')
-                self._log('✓ Autostart ON — app will start minimized at Windows login')
+                if getattr(sys, 'frozen', False):
+                    cmd = f'"{sys.executable}" --silent'
+                else:
+                    # dev: pythonw preferred if available, else python
+                    py = sys.executable
+                    script = os.path.abspath(__file__)
+                    cmd = f'"{py}" "{script}" --silent'
+                winreg.SetValueEx(key, 'ZKTeco_Utility', 0, winreg.REG_SZ, cmd)
+                self._log('✓ Autostart ON — login Windows → silent tray + auto pull')
+                self._log(f'  Run key: {cmd}')
             else:
-                try: winreg.DeleteValue(key, 'ZKTeco_Utility')
-                except FileNotFoundError: pass
+                try:
+                    winreg.DeleteValue(key, 'ZKTeco_Utility')
+                except FileNotFoundError:
+                    pass
                 self._log('✓ Autostart OFF')
             key.Close()
         except Exception as e:
@@ -1522,6 +2699,24 @@ class App(QMainWindow):
             self.ui(lambda: DeviceInfoDialog(self, info).exec())
         finally: conn.disconnect()
 
+    def _sync_user_map_from_device(self, ulist):
+        """Rebuild user_map from live device list — drop resign/ghost UIDs."""
+        old = dict(self.cfg.get('user_map') or {})
+        new_map = {}
+        for u in ulist:
+            key = str(int(u['uid']))
+            # keep config name if device name empty
+            name = (u.get('nama') or '').strip() or old.get(key) or f"UID:{key}"
+            new_map[key] = name
+        pruned = sorted(set(old) - set(new_map), key=lambda x: int(x) if x.isdigit() else x)
+        self.cfg['user_map'] = new_map
+        save_config(self.cfg)
+        if pruned:
+            names = ', '.join(f"{k}:{old[k]}" for k in pruned)
+            self._log(f'  user_map pruned (not on device): {names}')
+        self.ui(self._fill_week_emp_combo)
+        return new_map
+
     def _do_users(self):
         self._log('Fetching users from device ...')
         conn = self._get_conn()
@@ -1529,10 +2724,8 @@ class App(QMainWindow):
             users = conn.get_users()
             ulist = [{'uid': int(u.user_id), 'nama': u.name, 'card_id': getattr(u, 'card', '') or ''} for u in users]
             db_upsert_users(ulist)
-            for u in ulist:
-                if u['nama']: self.cfg['user_map'][str(u['uid'])] = u['nama']  # empty device name must not clobber config
-            save_config(self.cfg)
-            self._log(f'✓ {len(ulist)} users found and synced to config')
+            self._sync_user_map_from_device(ulist)
+            self._log(f'✓ {len(ulist)} users on device (user_map={len(self.cfg["user_map"])})')
             self.ui(lambda: UserManagerDialog(self, ulist, app=self).exec())
         finally: conn.disconnect()
 
@@ -1544,10 +2737,8 @@ class App(QMainWindow):
             users = conn.get_users()
             ulist = [{'uid': int(u.user_id), 'nama': u.name, 'card_id': getattr(u, 'card', '') or ''} for u in users]
             db_upsert_users(ulist)
-            for u in ulist:
-                if u['nama']: self.cfg['user_map'][str(u['uid'])] = u['nama']  # empty device name must not clobber config
-            save_config(self.cfg)
-            self._log(done_msg)
+            self._sync_user_map_from_device(ulist)
+            self._log(done_msg + f'  | device users: {len(ulist)}')
             self.ui(lambda: dlg._fill(ulist))
         finally: conn.disconnect()
 
@@ -1604,9 +2795,13 @@ class App(QMainWindow):
                     hhmm = att.timestamp.strftime('%H:%M') if att.timestamp else '?'
                     self._log(f'👆 {name} — {att.timestamp}')
                     self.ui(lambda n=name, h=hhmm: self._toast(f'👆 {n} absen — {h}'))
-                    # save immediately; UNIQUE timestamp makes later pulls dedup for free
-                    db_insert_attendance([{'uid': int(att.user_id), 'nama': name,
-                                           'timestamp': att.timestamp, 'punch': att.punch}])
+                    # save immediately; UNIQUE(uid,timestamp) dedups later pulls
+                    ins, skip = db_insert_attendance([{
+                        'uid': int(att.user_id), 'nama': name,
+                        'timestamp': att.timestamp, 'punch': att.punch,
+                    }])
+                    if skip:
+                        self._log(f'  (skip dup punch {name} @ {att.timestamp})')
                     self.ui(self._update_status)
                     self.ui(self._refresh_today)
             except Exception as e:
@@ -1622,17 +2817,24 @@ class App(QMainWindow):
         self.ui(lambda: self.btn_live.setText('📡 Live Monitor'))
         self._log('📡 Live monitor OFF')
 
-    def _check_capacity(self, conn):
+    def _check_capacity(self, conn, quiet=False):
         """Warn when the device log memory is nearly full."""
         try:
             conn.read_sizes()
             if conn.rec_cap and conn.records / conn.rec_cap >= 0.8:
                 pct = round(conn.records / conn.rec_cap * 100)
                 self._log(f'⚠ Device log {pct}% full ({conn.records:,}/{conn.rec_cap:,})')
-                self.ui(lambda: QMessageBox.warning(self, 'Log Hampir Penuh',
-                    f'Memori log mesin {pct}% penuh ({conn.records:,} dari {conn.rec_cap:,}).\n\n'
-                    f'Pull Data dulu, lalu jalankan "Clear Device Log" — kalau penuh, '
-                    f'absensi baru tidak akan tersimpan.'))
+                msg = (
+                    f'Memori log mesin {pct}% penuh ({conn.records:,}/{conn.rec_cap:,}). '
+                    f'Pull + Clear Device Log.'
+                )
+                if quiet:
+                    self.ui(lambda: self._tray_msg('Log Hampir Penuh', msg, QSystemTrayIcon.Warning))
+                else:
+                    self.ui(lambda: QMessageBox.warning(self, 'Log Hampir Penuh',
+                        f'Memori log mesin {pct}% penuh ({conn.records:,} dari {conn.rec_cap:,}).\n\n'
+                        f'Pull Data dulu, lalu jalankan "Clear Device Log" — kalau penuh, '
+                        f'absensi baru tidak akan tersimpan.'))
         except Exception as e:
             self._log(f'  (capacity check skipped: {e})')
 
@@ -1642,14 +2844,18 @@ class App(QMainWindow):
         conn.restart()   # device drops the link; no disconnect() after this
         self._log('✓ Restart command sent — device back in ~1 minute')
 
-    def _do_pull(self):
+    def _do_pull(self, quiet=False):
         self._log('Pulling attendance data from device ...')
         conn = self._get_conn()
         try:
-            self._check_clock(conn)
-            self._check_capacity(conn)
+            self._check_clock(conn, quiet=quiet)
+            self._check_capacity(conn, quiet=quiet)
             atts = conn.get_attendance()
-            if not atts: self._log('⚠ No data on device.'); return
+            if not atts:
+                self._log('⚠ No data on device.')
+                if quiet:
+                    self.ui(lambda: self._tray_msg('ZKTeco Pull', 'Tidak ada data di mesin.'))
+                return
             um = {int(k): v for k, v in self.cfg.get('user_map', {}).items()}
             recs = [{'uid': int(a.user_id), 'nama': um.get(int(a.user_id), f'UID:{a.user_id}'),
                      'timestamp': a.timestamp, 'punch': a.punch} for a in atts if a.timestamp]
@@ -1659,47 +2865,116 @@ class App(QMainWindow):
                 cfg_anchor = str(self.cfg.get('anomaly_anchor', '') or '').strip()
                 anchor = None
                 if cfg_anchor:
-                    try: anchor = datetime.strptime(cfg_anchor, '%Y-%m-%d').date()
-                    except Exception: anchor = None
-                if anchor is None: anchor = find_gap_start(normal)
-                remapped = remap_anomalies(anomaly, anchor,
-                                           self.cfg.get('jam_masuk', '08:00'),
-                                           self.cfg.get('jam_keluar', '16:00'))
-                n_days = len(set(r['timestamp'].date() for r in anomaly))
-                last = anchor + timedelta(days=max(0, n_days - 1))
-                self._log(f'⚠ {len(anomaly)} ANOMALY records detected (clock reset to year {ANOMALY_YEAR}).')
-                self._log(f'  → recovered onto {anchor.strftime("%d %b")} .. {last.strftime("%d %b %Y")} '
-                          f'({len(remapped)} punches)')
-                self._backup_anomaly_csv(remapped)
-                self.ui(lambda: QMessageBox.warning(self, 'Anomaly Recovered',
-                    f'{len(anomaly)} record dengan jam ter-reset (tahun {ANOMALY_YEAR}) ditemukan '
-                    f'dan DIPULIHKAN.\n\n'
-                    f'Dipetakan ke tanggal:\n{anchor.strftime("%d %b %Y")}  s/d  {last.strftime("%d %b %Y")}\n\n'
-                    f'Penyebab: mesin tanpa baterai RTC. Pastikan UPS tidak habis.\n\n'
-                    f'Backup mentah (jam asli vs hasil remap) disimpan di folder aplikasi.'))
-                self._cache = normal + remapped
+                    try:
+                        anchor = datetime.strptime(cfg_anchor, '%Y-%m-%d').date()
+                    except Exception:
+                        anchor = None
+                gaps = find_gaps(normal, min_len=2)
+                if anchor is None:
+                    anchor = find_gap_start(normal)
+                if anchor is None:
+                    # multi-gap or no calendar — require manual anchor
+                    gap_txt = '\n'.join(
+                        f'  • {s.strftime("%d %b %Y")} ({n} hari)' for s, n in gaps[:5]
+                    ) or '  (tidak ada gap terdeteksi di data normal)'
+                    self._log(f'⚠ {len(anomaly)} anomaly records — recovery NEEDS manual anchor date.')
+                    self._log(f'  Significant gaps:\n{gap_txt}')
+                    if quiet:
+                        self.ui(lambda: self._tray_msg(
+                            'Butuh Recovery Anchor',
+                            f'{len(anomaly)} record anomaly — set anchor di Settings.',
+                            QSystemTrayIcon.Warning))
+                    else:
+                        self.ui(lambda: QMessageBox.warning(
+                            self, 'Set Recovery Anchor',
+                            f'{len(anomaly)} record tahun {ANOMALY_YEAR} ditemukan, tetapi '
+                            f'auto-remap TIDAK dijalankan.\n\n'
+                            f'Alasan: beberapa gap multi-hari atau tidak ada data normal — '
+                            f'risiko menempel di tanggal libur/cuti.\n\n'
+                            f'Buka Settings → isi "Recovery anchor date" (hari pertama outage), '
+                            f'simpan, lalu Pull lagi.\n\n'
+                            f'Gap terdeteksi:\n{gap_txt}'))
+                    self._cache = normal  # store only safe rows
+                else:
+                    remapped = remap_anomalies(
+                        anomaly, anchor,
+                        self.cfg.get('jam_masuk', '08:00'),
+                        self.cfg.get('jam_keluar', '16:00'))
+                    n_days = len(set(r['timestamp'].date() for r in anomaly))
+                    last = anchor + timedelta(days=max(0, n_days - 1))
+                    self._log(f'⚠ {len(anomaly)} ANOMALY records (clock reset year {ANOMALY_YEAR}).')
+                    self._log(f'  → recovered onto {anchor.strftime("%d %b")} .. '
+                              f'{last.strftime("%d %b %Y")} ({len(remapped)} punches) [★ recovered]')
+                    if len(gaps) > 1:
+                        self._log(f'  (note: {len(gaps)} gaps found; using anchor {anchor})')
+                    self._backup_anomaly_csv(remapped)
+                    if quiet:
+                        self.ui(lambda: self._tray_msg(
+                            'Anomaly Recovered',
+                            f'{len(anomaly)} record dipulihkan ★ '
+                            f'{anchor.strftime("%d %b")}–{last.strftime("%d %b %Y")}'))
+                    else:
+                        self.ui(lambda: QMessageBox.warning(
+                            self, 'Anomaly Recovered',
+                            f'{len(anomaly)} record jam ter-reset DIPULIHKAN (ditandai ★).\n\n'
+                            f'{anchor.strftime("%d %b %Y")} s/d {last.strftime("%d %b %Y")}\n\n'
+                            f'Backup audit CSV di folder aplikasi.'))
+                    self._cache = normal + remapped
             else:
                 if anomaly:
-                    self._log(f'⚠ {len(anomaly)} anomaly records ignored (recovery disabled in Settings).')
+                    self._log(f'⚠ {len(anomaly)} anomaly records ignored (recovery disabled).')
                 self._cache = normal
-            new = db_insert_attendance(self._cache)
+            new, skipped = db_insert_attendance(self._cache)
             sid = db_add_pull_session(len(self._cache), new, self.ip_edit.text().strip())
-            self._log(f'✓ {len(atts)} records pulled  |  {new} new saved to database')
+            self._log(f'✓ {len(atts)} records pulled  |  {new} new saved  |  {skipped} skipped (dup)')
+            if skipped:
+                self._log(f'  (dup = same UID+timestamp already in DB)')
             self._log(f'  Pull session #{sid} recorded')
             if self.cfg.get('auto_backup', False):
                 ts = datetime.now().strftime('%Y%m%d_%H%M%S')
                 path = os.path.join(_BASE, f'backup_raw_{ts}.csv')
                 with open(path, 'w', newline='', encoding='utf-8') as f:
-                    w = csv.writer(f); w.writerow(['UserID','Name','Timestamp','Status','Recovered'])
+                    w = csv.writer(f)
+                    w.writerow(['UserID', 'Name', 'Timestamp', 'Punch', 'Recovered'])
                     for r in self._cache:
-                        w.writerow([r['uid'], r['nama'],
-                                    r['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if r['timestamp'] else '',
-                                    'Check-In' if r['punch'] == 0 else 'Check-Out',
-                                    'Y' if r.get('recovered') else ''])
+                        w.writerow([
+                            r['uid'], r['nama'],
+                            r['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if r['timestamp'] else '',
+                            r.get('punch', 0),
+                            'Y' if r.get('recovered') else '',
+                        ])
                 self._log(f'  Backup CSV → {path}')
+            # Auto cloud sync after pull (if enabled)
+            sync_note = ''
+            if self.cfg.get('cloud_sync_enabled') and self.cfg.get('cloud_sync_after_pull', True):
+                try:
+                    cloud_sync(self.cfg, punches=self._cache, log=self._log)
+                    sync_note = ' + cloud OK'
+                except Exception as e:
+                    self._log(f'⚠ Cloud sync gagal: {e}')
+                    sync_note = f' + cloud GAGAL: {e}'
+                    if quiet:
+                        self.ui(lambda e=e: self._tray_msg(
+                            'Cloud Sync Gagal', str(e), QSystemTrayIcon.Warning))
+            if quiet:
+                self.ui(lambda n=new, s=skipped, sn=sync_note: self._tray_msg(
+                    'ZKTeco Pull',
+                    f'{n} baru, {s} dup{sn}',
+                ))
             self.ui(self._refresh_history)
             self.ui(self._refresh_today)
-        finally: conn.disconnect()
+        finally:
+            conn.disconnect()
+
+    def _do_cloud_sync(self):
+        """Manual full DB sync → VST (employees + all punches + leaves)."""
+        try:
+            cloud_sync(self.cfg, punches=None, log=self._log)
+            self.ui(lambda: QMessageBox.information(
+                self, 'Cloud Sync', 'Sinkron ke VST berhasil.'))
+        except Exception as e:
+            self._log(f'⚠ Cloud sync gagal: {e}')
+            self.ui(lambda: QMessageBox.warning(self, 'Cloud Sync', str(e)))
 
     def _check_clock(self, conn, quiet=False):
         """Auto-sync device RTC to the PC clock when it has drifted."""
@@ -1850,9 +3125,12 @@ class App(QMainWindow):
 def main():
     qapp = QApplication(sys.argv)   # theme stylesheet applied by App._apply_theme
     qapp.setQuitOnLastWindowClosed(False)   # closing to tray must not quit
+    # single-instance-ish: optional later; silent + show flags
     win = App()
-    if '--minimized' in sys.argv and win._tray:
-        pass   # start hidden in tray
+    silent = '--silent' in sys.argv or '--minimized' in sys.argv
+    if silent and win._tray:
+        # stay hidden in tray; auto-pull scheduled in App.__init__
+        pass
     else:
         win.show()
     sys.exit(qapp.exec())

@@ -23,22 +23,27 @@
 | Feature | Description |
 |---------|-------------|
 | Direct TCP connection | Connects to device via TCP — no ADMS/cloud needed |
-| Set device time | Sync RTC clock to PC time in one click |
-| Pull attendance | Fetch all logs, auto-deduplicate, save to local SQLite |
-| Excel report | Attendance card, recap, late report, log detail |
-| User management | View registered users synced from device |
-| Device info | Firmware, serial number, memory usage |
-| Clear device log | Free up device memory after pulling data |
-| Auto backup CSV | Raw backup on every pull |
-| Auto update | Check and download latest version from GitHub |
-| Multi-language | English / Bahasa Indonesia |
+| Auto clock sync | RTC auto-synced to PC (eFace10 has no RTC battery) |
+| Pull attendance | Fetch logs, dedupe, SQLite; anomaly recovery for year-2000 timestamps |
+| Excel report | Attendance card, recap, log detail (+ flags: no-checkout, recovered) |
+| Payroll CSV | Export UID/Nama/tanggal/masuk/keluar/telat/status for payroll systems |
+| Izin / Cuti / Dinas | Manual leave calendar per employee (affects daily view & payroll) |
+| Forced in/out mode | Optional: use device punch codes (0/4=in, 1/5=out) instead of first/last |
+| Live monitor | Real-time punches + toast while app runs (incl. tray) |
+| User management | View/add/rename/delete users on device |
+| Device info | Firmware, serial, memory capacity warning |
+| Clear device log | Free device memory after pull |
+| Auto backup CSV | Optional raw backup on every pull |
+| Cloud sync (VST) | Push employees + punches + leave ke VST-laravel (`/api/attendance/sync`) |
+| Silent mode | Tray only; Windows login → auto pull + cloud sync (interval optional) |
+| Auto update | GitHub Releases |
+| Report language | English / Bahasa Indonesia (Excel headers) |
 | Cross-platform | Windows, Linux, macOS |
 
-### Smart Deduplication
-All face scan taps on the same day collapse to **2 valid records**:
-- **Earliest tap** = check-in
-- **Latest tap** = check-out
-- All taps in between are ignored
+### In/Out logic
+**Default (First/Last):** all face taps that day collapse to earliest = check-in, latest = check-out.  
+**Forced device punch:** uses machine status (0/4 = in, 1/5 = out).  
+Single-tap days are flagged **NO_CHECKOUT** (no checkout).
 
 ---
 
@@ -92,6 +97,22 @@ python zkteco_app.py
 ```
 
 Language can be switched (English / Bahasa Indonesia) from the header dropdown without restarting.
+
+### Cloud Sync → VST Absensi
+
+1. Di web **https://service.rejekiamerta.com** login admin → sidebar **Absensi → Absensi Karyawan**
+2. Klik **Generate Token**, salin **API Base URL** + **API Token**
+3. Di ZKTeco Utility → **Settings → Cloud Sync (VST Absensi)**:
+   - centang **Enable sync**
+   - paste URL (`https://service.rejekiamerta.com/api/attendance`)
+   - paste token
+   - (opsional) **Auto-sync after every Pull**
+4. **Pull** dari mesin, atau tombol **☁ Sync to VST Cloud** (full DB)
+
+Endpoint:
+- `POST /api/attendance/sync` — body JSON `{ employees, punches, leaves }`
+- `GET /api/attendance/employees` — daftar karyawan aktif company
+- Auth: `Authorization: Bearer <token>` (per-company)
 
 ---
 
