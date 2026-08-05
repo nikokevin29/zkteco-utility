@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue"/>
   <img src="https://img.shields.io/badge/python-3.9%2B-green"/>
   <img src="https://img.shields.io/badge/license-MIT-brightgreen"/>
-  <img src="https://img.shields.io/github/v/release/nikokevin29/zkteco-utility"/>
+  <img src="https://img.shields.io/github/v/release/xbanana29/zkteco-utility"/>
 </p>
 
 ---
@@ -49,7 +49,7 @@ Single-tap days are flagged **NO_CHECKOUT** (no checkout).
 
 ## Download
 
-### [Latest Release](https://github.com/nikokevin29/zkteco-utility/releases/latest)
+### [Latest Release](https://github.com/xbanana29/zkteco-utility/releases/latest)
 
 | Platform | File |
 |----------|------|
@@ -71,11 +71,22 @@ chmod +x ZKTeco_Utility_Linux
 
 **From source:**
 ```bash
-git clone https://github.com/nikokevin29/zkteco-utility.git
+git clone https://github.com/xbanana29/zkteco-utility.git
 cd zkteco-utility
-pip install pyzk openpyxl
+pip install pyzk openpyxl PySide6
 python zkteco_app.py
 ```
+
+### Build release binaries (GitHub Actions)
+
+Push tag `vX.Y.Z` (e.g. `v5.0.1`) → CI runs tests, builds Windows / Linux / macOS, and publishes a GitHub Release.
+
+```bash
+git tag v5.0.1
+git push origin v5.0.1
+```
+
+Manual re-build (no release): Actions → **Test, Build & Release** → **Run workflow**.
 
 ---
 

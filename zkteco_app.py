@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QIcon, QAction, QColor, QFont
 
-APP_VERSION = "5.3.1"
+APP_VERSION = "5.0.1"
 # Frozen exe: data lives next to the exe, NOT next to __file__ (which points
 # into the throwaway _MEIxxxx extraction dir on onefile builds).
 _BASE = (os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
