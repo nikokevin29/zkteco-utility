@@ -17,8 +17,10 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QMenu, QAbstractItemView, QSizePolicy, QGraphicsOpacityEffect)
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QIcon, QAction, QColor, QFont
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
-APP_VERSION = "5.0.1"
+APP_VERSION = "5.0.2"
+_INSTANCE_KEY = "ZKTecoUtilityCVRAJ_single"
 # Frozen exe: data lives next to the exe, NOT next to __file__ (which points
 # into the throwaway _MEIxxxx extraction dir on onefile builds).
 _BASE = (os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
@@ -508,6 +510,25 @@ def db_holiday_set(year=None, month=None):
 # ─────────────────────────────────────────────────────────────────────────────
 # CLOUD SYNC → VST-laravel (POST /api/attendance/sync)
 # ─────────────────────────────────────────────────────────────────────────────
+def normalize_cloud_token(token):
+    """Bersihkan token dari paste error (Bearer prefix, spasi, BOM, quotes)."""
+    t = (token or '').strip().strip('"').strip("'")
+    t = t.replace('\ufeff', '').replace('\u200b', '').replace('\u00a0', ' ')
+    # hapus semua whitespace (paste multi-baris / spasi di tengah)
+    t = ''.join(t.split())
+    if t.lower().startswith('bearer'):
+        t = t[6:].lstrip(':').lstrip()
+    return t
+
+
+def normalize_cloud_base_url(url):
+    """Normalisasi base URL agar selalu .../api/attendance (tanpa /sync)."""
+    u = (url or '').strip().rstrip('/')
+    if u.lower().endswith('/sync'):
+        u = u[:-5].rstrip('/')
+    return u
+
+
 def build_cloud_payload(cfg, punches=None, year=None, month=None):
     """Build JSON body for VST attendance sync API."""
     um = cfg.get('user_map') or {}
@@ -552,6 +573,65 @@ def build_cloud_payload(cfg, punches=None, year=None, month=None):
     }
 
 
+def cloud_credentials_ok(cfg, log=None):
+    """
+    Tes credential ke VST (GET /employees).
+    Returns dict {ok, status, message}. Raises RuntimeError jika config kosong.
+    """
+    def _log(msg):
+        if log:
+            log(msg)
+
+    base = normalize_cloud_base_url(cfg.get('cloud_api_url') or '')
+    token = normalize_cloud_token(cfg.get('cloud_api_token') or '')
+    if not base or not token:
+        raise RuntimeError('Cloud API URL / token kosong. Isi di Settings → Cloud Sync.')
+
+    url = base + '/employees'
+    req = urllib.request.Request(
+        url, method='GET',
+        headers={
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {token}',
+            'X-Attendance-Token': token,  # fallback jika proxy strip Authorization
+            'User-Agent': f'ZKTeco-Utility/{APP_VERSION}',
+        },
+    )
+    _log(f'☁ Tes credential → {url} ...')
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+            data = json.loads(raw) if raw else {}
+            n = len(data.get('employees') or [])
+            msg = f'Credential OK — {n} karyawan di VST'
+            _log(f'✓ {msg}')
+            return {'ok': True, 'status': resp.status, 'message': msg, 'employees': n}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode('utf-8', errors='replace')[:400]
+        hint = _cloud_auth_hint(e.code, err_body)
+        raise RuntimeError(f'HTTP {e.code}: {err_body or e.reason}{hint}') from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f'Network: {e.reason}') from e
+
+
+def _cloud_auth_hint(code, body=''):
+    b = (body or '').lower()
+    if code == 401:
+        return (
+            '\n→ Token ditolak server. Di web VST: Pengaturan → Sync ZKTeco Desktop → '
+            'salin token terbaru (jangan pakai prefix "Bearer "). '
+            'Generate Ulang Token mematikan token lama di desktop.'
+        )
+    if code == 404:
+        return (
+            '\n→ URL salah. Base harus seperti: '
+            'https://service.rejekiamerta.com/api/attendance (tanpa /sync di ujung).'
+        )
+    if code == 422 or 'validation' in b:
+        return '\n→ Payload tidak valid (bukan masalah credential).'
+    return ''
+
+
 def cloud_sync(cfg, punches=None, year=None, month=None, log=None):
     """POST employees + punches + leaves to VST API. Returns result dict or raises."""
     def _log(msg):
@@ -560,10 +640,13 @@ def cloud_sync(cfg, punches=None, year=None, month=None, log=None):
 
     if not cfg.get('cloud_sync_enabled'):
         raise RuntimeError('Cloud sync disabled (Settings → Cloud Sync).')
-    base = (cfg.get('cloud_api_url') or '').rstrip('/')
-    token = (cfg.get('cloud_api_token') or '').strip()
+    base = normalize_cloud_base_url(cfg.get('cloud_api_url') or '')
+    token = normalize_cloud_token(cfg.get('cloud_api_token') or '')
+    # persist cleaned credentials so next save/load stays clean
+    cfg['cloud_api_url'] = base
+    cfg['cloud_api_token'] = token
     if not base or not token:
-        raise RuntimeError('Cloud API URL / token kosong. Isi di Settings.')
+        raise RuntimeError('Cloud API URL / token kosong. Isi di Settings → Cloud Sync.')
 
     url = base + '/sync'
     body = build_cloud_payload(cfg, punches=punches, year=year, month=month)
@@ -574,6 +657,7 @@ def cloud_sync(cfg, punches=None, year=None, month=None, log=None):
             'Content-Type': 'application/json',
             'Accept': 'application/json',
             'Authorization': f'Bearer {token}',
+            'X-Attendance-Token': token,  # fallback jika proxy strip Authorization
             'User-Agent': f'ZKTeco-Utility/{APP_VERSION}',
         },
     )
@@ -586,7 +670,8 @@ def cloud_sync(cfg, punches=None, year=None, month=None, log=None):
             result = json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
         err_body = e.read().decode('utf-8', errors='replace')[:400]
-        raise RuntimeError(f'HTTP {e.code}: {err_body or e.reason}') from e
+        hint = _cloud_auth_hint(e.code, err_body)
+        raise RuntimeError(f'HTTP {e.code}: {err_body or e.reason}{hint}') from e
     except urllib.error.URLError as e:
         raise RuntimeError(f'Network: {e.reason}') from e
 
@@ -1521,13 +1606,32 @@ class SettingsDialog(QDialog):
             'cloud_api_url', 'https://service.rejekiamerta.com/api/attendance')))
         self.edits['cloud_api_token'] = QLineEdit(str(cfg.get('cloud_api_token', '')))
         self.edits['cloud_api_token'].setEchoMode(QLineEdit.Password)
-        self.edits['cloud_api_token'].setPlaceholderText('Token dari Admin → Absensi Karyawan')
+        self.edits['cloud_api_token'].setPlaceholderText(
+            'Token dari VST: Pengaturan → Sync ZKTeco Desktop')
+        # toggle show token (Password mode sering bikin paste salah / susah cek)
+        self._tok_visible = False
+        tok_row = QHBoxLayout()
+        tok_row.addWidget(self.edits['cloud_api_token'], 1)
+        self._btn_show_tok = QPushButton('👁')
+        self._btn_show_tok.setFixedWidth(36)
+        self._btn_show_tok.setToolTip('Tampilkan / sembunyikan token')
+        self._btn_show_tok.clicked.connect(self._toggle_token_visible)
+        tok_row.addWidget(self._btn_show_tok)
         cf.addRow('API Base URL', self.edits['cloud_api_url'])
-        cf.addRow('API Token', self.edits['cloud_api_token'])
+        cf.addRow('API Token', tok_row)
         cl.addLayout(cf)
-        tip = QLabel('Token digenerate di web: Absensi Karyawan → Generate Token.\n'
-                     'URL default: https://service.rejekiamerta.com/api/attendance')
-        tip.setStyleSheet('color:#888; font-size:8pt;'); cl.addWidget(tip)
+        tip = QLabel(
+            '1) Login VST → Pengaturan → Sync ZKTeco Desktop\n'
+            '2) Salin API Base URL + Token (hanya hex, tanpa "Bearer ")\n'
+            '3) Setelah Generate Ulang Token di web, update token di sini\n'
+            'URL default: https://service.rejekiamerta.com/api/attendance'
+        )
+        tip.setStyleSheet('color:#888; font-size:8pt;')
+        tip.setWordWrap(True)
+        cl.addWidget(tip)
+        test_btn = QPushButton('🔗 Tes koneksi VST')
+        test_btn.clicked.connect(self._test_cloud)
+        cl.addWidget(test_btn)
         lay.addWidget(cloud_box)
 
         btns = QHBoxLayout()
@@ -1536,19 +1640,45 @@ class SettingsDialog(QDialog):
         btns.addStretch(); btns.addWidget(ok); btns.addWidget(cancel)
         lay.addLayout(btns)
 
-    def _save(self):
+    def _toggle_token_visible(self):
+        self._tok_visible = not self._tok_visible
+        mode = QLineEdit.Normal if self._tok_visible else QLineEdit.Password
+        self.edits['cloud_api_token'].setEchoMode(mode)
+
+    def _collect_cfg(self):
         for key, e in self.edits.items():
             v = e.text().strip()
             if key in ('toleransi', 'comm_password', 'port', 'auto_pull_interval_min'):
-                try: v = int(v)
-                except ValueError: pass
+                try:
+                    v = int(v)
+                except ValueError:
+                    pass
             self.cfg[key] = v
         self.cfg['punch_mode'] = self.punch_cb.currentData()
         for key, cb in self.checks.items():
             self.cfg[key] = cb.isChecked()
-        # silent mode implies autostart for hands-off operation
         if self.cfg.get('silent_mode'):
             self.cfg['autostart'] = True
+        # normalisasi credential agar paste "Bearer xxx" / URL .../sync tidak gagal
+        self.cfg['cloud_api_url'] = normalize_cloud_base_url(self.cfg.get('cloud_api_url') or '')
+        self.cfg['cloud_api_token'] = normalize_cloud_token(self.cfg.get('cloud_api_token') or '')
+        return self.cfg
+
+    def _test_cloud(self):
+        cfg = dict(self._collect_cfg())
+        # pastikan tes jalan meski checkbox belum dicentang
+        cfg['cloud_sync_enabled'] = True
+        try:
+            result = cloud_credentials_ok(cfg)
+            QMessageBox.information(self, 'Tes VST', result.get('message', 'OK'))
+        except Exception as e:
+            QMessageBox.warning(self, 'Tes VST gagal', str(e))
+
+    def _save(self):
+        self._collect_cfg()
+        # sync field UI ke nilai yang sudah dinormalisasi
+        self.edits['cloud_api_url'].setText(self.cfg.get('cloud_api_url') or '')
+        self.edits['cloud_api_token'].setText(self.cfg.get('cloud_api_token') or '')
         save_config(self.cfg)
         self.on_save(self.cfg)
         self.accept()
@@ -1859,9 +1989,14 @@ class App(QMainWindow):
         menu.addSeparator()
         menu.addAction(a_exit)
         self._tray.setContextMenu(menu)
-        self._tray.activated.connect(
-            lambda reason: self._tray_open() if reason == QSystemTrayIcon.Trigger else None)
+        # Double-click saja yang buka window — single click di tray sering
+        # tidak sengaja (icon "jiggle"/overflow) dan terasa seperti glitch.
+        self._tray.activated.connect(self._on_tray_activated)
         self._tray.show()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self._tray_open()
 
     def closeEvent(self, ev):
         # always prefer tray when available (silent mode)
@@ -1871,7 +2006,7 @@ class App(QMainWindow):
             if self.cfg.get('silent_mode') or self._boot_silent_flag:
                 self._tray_msg(
                     'ZKTeco Utility',
-                    'Berjalan di tray. Klik kanan ikon → Open / Exit.',
+                    'Berjalan di tray. Double-click ikon untuk buka · klik kanan → Exit.',
                     QSystemTrayIcon.Information,
                 )
         else:
@@ -1881,6 +2016,10 @@ class App(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        try:
+            self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
+        except Exception:
+            pass
 
     def _tray_exit(self):
         self._live_want = False
@@ -2509,13 +2648,19 @@ class App(QMainWindow):
             self._log(f'[ERROR] Autostart: {e}')
 
     def _toast(self, msg):
-        """Notification bottom-right with fade-in; shows even while hidden to tray."""
-        t = QLabel(msg)
-        t.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        """Notifikasi punch. Saat window disembunyikan ke tray → balloon tray saja
+        (hindari 'jendela hantu' floating yang sering dianggap glitch)."""
+        if not self.isVisible() or self.isMinimized():
+            self._tray_msg('Absensi', msg)
+            return
+        t = QLabel(msg, self)  # child of main window → tidak jadi top-level window
+        t.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        t.setAttribute(Qt.WA_ShowWithoutActivating, True)
         t.setStyleSheet(f'background:{ACCENT}; color:white; font-size:10pt; font-weight:600; '
                         'padding:12px 18px; border-radius:10px;')
         t.adjustSize()
         scr = QApplication.primaryScreen().availableGeometry()
+        # posisi global, tapi jangan curi focus dari app lain
         t.move(scr.right() - t.width() - 16, scr.bottom() - t.height() - 16)
         eff = QGraphicsOpacityEffect(t); t.setGraphicsEffect(eff)
         anim = QPropertyAnimation(eff, b'opacity', t)
@@ -3122,12 +3267,62 @@ class App(QMainWindow):
             QApplication.quit()
 
 
+def _want_silent_boot(cfg=None):
+    if '--show' in sys.argv:
+        return False
+    if '--silent' in sys.argv or '--minimized' in sys.argv:
+        return True
+    if cfg is not None and cfg.get('silent_mode'):
+        return True
+    return False
+
+
+def _handoff_to_running_instance():
+    """Jika instance sudah jalan, minta buka window (kecuali boot silent). Return True = exit."""
+    sock = QLocalSocket()
+    sock.connectToServer(_INSTANCE_KEY)
+    if not sock.waitForConnected(250):
+        return False
+    cmd = b'ping\n' if _want_silent_boot() else b'show\n'
+    sock.write(cmd)
+    sock.flush()
+    sock.waitForBytesWritten(400)
+    sock.disconnectFromServer()
+    return True
+
+
 def main():
     qapp = QApplication(sys.argv)   # theme stylesheet applied by App._apply_theme
     qapp.setQuitOnLastWindowClosed(False)   # closing to tray must not quit
-    # single-instance-ish: optional later; silent + show flags
+
+    # Single instance: cegah window "muncul sendiri" karena autostart + buka manual
+    # (atau dua shortcut) membuka proses kedua.
+    if _handoff_to_running_instance():
+        return 0
+
+    QLocalServer.removeServer(_INSTANCE_KEY)
+    server = QLocalServer()
+    if not server.listen(_INSTANCE_KEY):
+        # stale lock — coba sekali lagi
+        QLocalServer.removeServer(_INSTANCE_KEY)
+        server.listen(_INSTANCE_KEY)
+
     win = App()
-    silent = '--silent' in sys.argv or '--minimized' in sys.argv
+
+    def _on_ipc():
+        client = server.nextPendingConnection()
+        if not client:
+            return
+        client.waitForReadyRead(300)
+        data = bytes(client.readAll()).decode('utf-8', errors='ignore').strip().lower()
+        client.disconnectFromServer()
+        # show = buka dashboard; ping = instance kedua silent, abaikan
+        if data.startswith('show') or data == '':
+            win._tray_open()
+
+    server.newConnection.connect(_on_ipc)
+
+    silent = _want_silent_boot(win.cfg)
     if silent and win._tray:
         # stay hidden in tray; auto-pull scheduled in App.__init__
         pass

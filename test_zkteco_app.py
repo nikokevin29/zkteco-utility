@@ -662,6 +662,24 @@ class TestAppSyntax(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             app.cloud_sync(cfg, punches=[])
 
+    def test_normalize_cloud_token_strips_bearer_and_space(self):
+        raw = 'Bearer  e6dca9f4e81a163c\n0da17e37 '
+        self.assertEqual(
+            app.normalize_cloud_token(raw),
+            'e6dca9f4e81a163c0da17e37',
+        )
+        self.assertEqual(
+            app.normalize_cloud_token('"abc123"'),
+            'abc123',
+        )
+
+    def test_normalize_cloud_base_url_strips_sync_suffix(self):
+        u = 'https://service.rejekiamerta.com/api/attendance/sync/'
+        self.assertEqual(
+            app.normalize_cloud_base_url(u),
+            'https://service.rejekiamerta.com/api/attendance',
+        )
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 9. INTEGRATION — full pull → generate → snapshot → load flow

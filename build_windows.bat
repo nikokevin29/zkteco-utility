@@ -1,7 +1,7 @@
 @echo off
 title ZKTeco Utility - Windows Build
 echo ============================================
-echo  ZKTeco eFace10 Utility - Windows Build v5.0.1
+echo  ZKTeco eFace10 Utility - Windows Build v5.0.2
 echo ============================================
 echo.
 

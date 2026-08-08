@@ -238,6 +238,12 @@ jobs:
             **Linux:** `chmod +x ZKTeco_Utility_Linux && ./ZKTeco_Utility_Linux`
             **macOS:** `chmod +x ZKTeco_Utility_macOS && ./ZKTeco_Utility_macOS` (boleh perlu Right-click → Open)
 
+            ### v5.0.2
+            - Cloud sync VST: normalisasi token/URL, header fallback, tombol **Tes koneksi VST**
+            - Single-instance (cegah window dobel dari autostart + shortcut)
+            - Silent mode dihormati saat boot; buka tray lewat **double-click**
+            - Toast absensi tidak jadi “jendela hantu” saat app di tray
+
             ### Fitur utama
             - Pull absensi + anomaly recovery (RTC eFace10)
             - Excel report + payroll CSV
