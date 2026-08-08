@@ -79,11 +79,11 @@ python zkteco_app.py
 
 ### Build release binaries (GitHub Actions)
 
-Push tag `vX.Y.Z` (e.g. `v5.0.1`) → CI runs tests, builds Windows / Linux / macOS, and publishes a GitHub Release.
+Push tag `vX.Y.Z` (e.g. `v5.0.2`) → CI runs tests, builds Windows / Linux / macOS, and publishes a GitHub Release.
 
 ```bash
-git tag v5.0.1
-git push origin v5.0.1
+git tag v5.0.2
+git push origin v5.0.2
 ```
 
 Manual re-build (no release): Actions → **Test, Build & Release** → **Run workflow**.
