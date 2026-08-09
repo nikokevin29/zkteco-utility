@@ -4,7 +4,7 @@ echo "============================================"
 echo " ZKTeco Utility — Linux Build"
 echo "============================================"
 
-pip install pyzk openpyxl PySide6 pyinstaller --quiet
+pip install pyzk openpyxl PySide6 certifi pyinstaller --quiet
 
 pyinstaller --noconfirm --clean --onefile --windowed \
   --name "ZKTeco_Utility_Linux" \
@@ -13,6 +13,7 @@ pyinstaller --noconfirm --clean --onefile --windowed \
   --collect-all openpyxl \
   --collect-all zk \
   --collect-all PySide6 \
+  --collect-all certifi \
   --hidden-import openpyxl \
   --hidden-import openpyxl.styles \
   --hidden-import openpyxl.utils \
@@ -20,6 +21,7 @@ pyinstaller --noconfirm --clean --onefile --windowed \
   --hidden-import openpyxl.formatting \
   --hidden-import zk \
   --hidden-import updater \
+  --hidden-import certifi \
   --exclude-module pandas \
   --exclude-module numpy \
   --exclude-module matplotlib \

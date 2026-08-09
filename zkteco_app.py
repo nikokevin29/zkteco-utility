@@ -5,7 +5,7 @@ Split panel: kiri workflow, kanan viewer + history
 Semua data disimpan di SQLite, tidak ada file temp eksternal
 """
 
-import csv, os, threading, calendar, sqlite3, json, sys, time, urllib.request, urllib.error
+import csv, os, threading, calendar, sqlite3, json, sys, time, ssl, urllib.request, urllib.error
 from collections import defaultdict
 from datetime import datetime, date, timedelta
 
@@ -19,7 +19,39 @@ from PySide6.QtCore import Qt, QObject, Signal, QTimer, QPropertyAnimation, QEas
 from PySide6.QtGui import QIcon, QAction, QColor, QFont
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
-APP_VERSION = "5.0.2"
+APP_VERSION = "5.0.3"
+
+
+def _install_ssl_trust_fix():
+    """
+    Avoid Windows trust-store path bugs (e.g. expired DST Root CA X3 still trusted)
+    that break Let's Encrypt chains with: certificate verify failed: certificate has expired.
+
+    Prefer Mozilla CA bundle via certifi so urllib HTTPS does not load the broken
+    Windows root path. Safe no-op if certifi is unavailable.
+    """
+    try:
+        import certifi
+        cafile = certifi.where()
+        if not cafile or not os.path.isfile(cafile):
+            return
+    except Exception:
+        return
+
+    _orig = ssl.create_default_context
+
+    def _create_default_context(*args, **kwargs):
+        # Only inject when caller did not provide an explicit CA source.
+        if not kwargs.get('cafile') and not kwargs.get('capath') and not kwargs.get('cadata'):
+            kwargs = dict(kwargs)
+            kwargs['cafile'] = cafile
+        return _orig(*args, **kwargs)
+
+    ssl.create_default_context = _create_default_context
+    ssl._create_default_https_context = _create_default_context
+
+
+_install_ssl_trust_fix()
 _INSTANCE_KEY = "ZKTecoUtilityCVRAJ_single"
 # Frozen exe: data lives next to the exe, NOT next to __file__ (which points
 # into the throwaway _MEIxxxx extraction dir on onefile builds).
@@ -599,7 +631,7 @@ def cloud_credentials_ok(cfg, log=None):
     )
     _log(f'☁ Tes credential → {url} ...')
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30, context=ssl.create_default_context()) as resp:
             raw = resp.read().decode('utf-8', errors='replace')
             data = json.loads(raw) if raw else {}
             n = len(data.get('employees') or [])
@@ -665,7 +697,7 @@ def cloud_sync(cfg, punches=None, year=None, month=None, log=None):
          f'{len(body["employees"])} emp, {len(body["leaves"])} leave, '
          f'{len(body.get("holidays", []))} libur) ...')
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=60, context=ssl.create_default_context()) as resp:
             raw = resp.read().decode('utf-8', errors='replace')
             result = json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:

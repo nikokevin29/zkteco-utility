@@ -11,6 +11,7 @@ import os
 import sys
 import json
 import shutil
+import ssl
 import tempfile
 import threading
 import urllib.request
@@ -28,6 +29,15 @@ ASSET_NAME = {
 }
 
 
+def _ssl_context():
+    """Use Mozilla CA bundle when available (avoids expired Windows root CA bugs)."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
 def _version_tuple(v: str):
     try:
         return tuple(int(x) for x in v.lstrip('v').split('.'))
@@ -42,7 +52,7 @@ def get_latest_release() -> dict | None:
             API_URL,
             headers={"User-Agent": "ZKTeco-Utility-Updater"}
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10, context=_ssl_context()) as resp:
             data = json.loads(resp.read().decode())
 
         tag    = data.get("tag_name", "")
@@ -117,7 +127,7 @@ def download_and_replace(
                 download_url,
                 headers={"User-Agent": "ZKTeco-Utility-Updater"}
             )
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=120, context=_ssl_context()) as resp:
                 total      = int(resp.headers.get("Content-Length", 0))
                 downloaded = 0
                 chunk_size = 65536

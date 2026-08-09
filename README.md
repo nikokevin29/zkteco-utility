@@ -73,17 +73,17 @@ chmod +x ZKTeco_Utility_Linux
 ```bash
 git clone https://github.com/xbanana29/zkteco-utility.git
 cd zkteco-utility
-pip install pyzk openpyxl PySide6
+pip install pyzk openpyxl PySide6 certifi
 python zkteco_app.py
 ```
 
 ### Build release binaries (GitHub Actions)
 
-Push tag `vX.Y.Z` (e.g. `v5.0.2`) → CI runs tests, builds Windows / Linux / macOS, and publishes a GitHub Release.
+Push tag `vX.Y.Z` (e.g. `v5.0.3`) → CI runs tests, builds Windows / Linux / macOS, and publishes a GitHub Release.
 
 ```bash
-git tag v5.0.2
-git push origin v5.0.2
+git tag v5.0.3
+git push origin v5.0.3
 ```
 
 Manual re-build (no release): Actions → **Test, Build & Release** → **Run workflow**.

@@ -1,12 +1,12 @@
 @echo off
 title ZKTeco Utility - Windows Build
 echo ============================================
-echo  ZKTeco eFace10 Utility - Windows Build v5.0.2
+echo  ZKTeco eFace10 Utility - Windows Build v5.0.3
 echo ============================================
 echo.
 
 echo [1/3] Install dependencies...
-pip install pyzk openpyxl pyinstaller PySide6 --quiet
+pip install pyzk openpyxl pyinstaller PySide6 certifi --quiet
 if %errorlevel% neq 0 (
     echo ERROR: pip install gagal.
     pause & exit /b 1
@@ -23,6 +23,7 @@ pyinstaller --noconfirm --clean --onefile --windowed ^
   --collect-all openpyxl ^
   --collect-all zk ^
   --collect-all PySide6 ^
+  --collect-all certifi ^
   --hidden-import openpyxl ^
   --hidden-import openpyxl.styles ^
   --hidden-import openpyxl.styles.fills ^
@@ -38,6 +39,7 @@ pyinstaller --noconfirm --clean --onefile --windowed ^
   --hidden-import zk.user ^
   --hidden-import zk.attendance ^
   --hidden-import updater ^
+  --hidden-import certifi ^
   --exclude-module pandas ^
   --exclude-module tkinter ^
   --exclude-module PIL ^

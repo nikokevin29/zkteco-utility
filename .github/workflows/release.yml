@@ -43,7 +43,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install pyzk openpyxl PySide6 pytest pytest-cov
+          pip install pyzk openpyxl PySide6 certifi pytest pytest-cov
 
       - name: Run unit tests
         run: |
@@ -111,7 +111,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyzk openpyxl PySide6 pyinstaller
+          pip install pyzk openpyxl PySide6 certifi pyinstaller
 
       - name: Build with PyInstaller (Windows)
         if: runner.os == 'Windows'
@@ -127,6 +127,7 @@ jobs:
             --collect-all openpyxl `
             --collect-all zk `
             --collect-all PySide6 `
+            --collect-all certifi `
             --hidden-import openpyxl `
             --hidden-import openpyxl.styles `
             --hidden-import openpyxl.styles.fills `
@@ -142,6 +143,7 @@ jobs:
             --hidden-import zk.user `
             --hidden-import zk.attendance `
             --hidden-import updater `
+            --hidden-import certifi `
             --exclude-module pandas `
             --exclude-module numpy `
             --exclude-module scipy `
@@ -164,6 +166,7 @@ jobs:
             --collect-all openpyxl \
             --collect-all zk \
             --collect-all PySide6 \
+            --collect-all certifi \
             --hidden-import openpyxl \
             --hidden-import openpyxl.styles \
             --hidden-import openpyxl.styles.fills \
@@ -179,6 +182,7 @@ jobs:
             --hidden-import zk.user \
             --hidden-import zk.attendance \
             --hidden-import updater \
+            --hidden-import certifi \
             --exclude-module pandas \
             --exclude-module numpy \
             --exclude-module scipy \
@@ -238,11 +242,11 @@ jobs:
             **Linux:** `chmod +x ZKTeco_Utility_Linux && ./ZKTeco_Utility_Linux`
             **macOS:** `chmod +x ZKTeco_Utility_macOS && ./ZKTeco_Utility_macOS` (boleh perlu Right-click → Open)
 
-            ### v5.0.2
-            - Cloud sync VST: normalisasi token/URL, header fallback, tombol **Tes koneksi VST**
-            - Single-instance (cegah window dobel dari autostart + shortcut)
-            - Silent mode dihormati saat boot; buka tray lewat **double-click**
-            - Toast absensi tidak jadi “jendela hantu” saat app di tray
+            ### v5.0.3
+            - **Fix Cloud Sync SSL** di Windows: `CERTIFICATE_VERIFY_FAILED: certificate has expired`
+            - Root cause: Windows trust store masih memercayai **DST Root CA X3** (expired 2021) sehingga rantai Let's Encrypt gagal diverifikasi
+            - HTTPS cloud sync + auto-updater sekarang memakai **Mozilla CA bundle (`certifi`)**, tidak bergantung root Windows yang rusak
+            - Bundle `certifi` di-include ke PyInstaller (Windows/Linux/macOS)
 
             ### Fitur utama
             - Pull absensi + anomaly recovery (RTC eFace10)
@@ -253,7 +257,7 @@ jobs:
 
             ### From source
             ```bash
-            pip install pyzk openpyxl PySide6
+            pip install pyzk openpyxl PySide6 certifi
             python zkteco_app.py
             ```
           files: |

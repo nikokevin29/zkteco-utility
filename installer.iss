@@ -1,6 +1,6 @@
 ; ZKTeco Utility — Windows installer (Inno Setup)
 ; Build: ISCC installer.iss   (needs dist\ZKTeco_Utility.exe built first)
-#define AppVersion "5.0.2"
+#define AppVersion "5.0.3"
 
 [Setup]
 AppId=ZKTecoUtilityCVRAJ
